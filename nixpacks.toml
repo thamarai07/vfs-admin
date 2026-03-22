@@ -1,0 +1,12 @@
+[phases.build]
+cmds = [
+  "echo 'Build complete'"
+]
+
+[phases.start]
+cmds = [
+  "apache2-foreground"
+]
+
+[variables]
+PHP_VERSION = "8.2"

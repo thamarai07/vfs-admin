@@ -1,0 +1,39 @@
+Options -Indexes
+ServerSignature Off
+
+# -----------------------------------------------
+# CORS & Security (backup – also set in cors.php)
+# -----------------------------------------------
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set X-Frame-Options "DENY"
+    Header always set X-XSS-Protection "1; mode=block"
+    Header always set Referrer-Policy "strict-origin-when-cross-origin"
+</IfModule>
+
+# -----------------------------------------------
+# Deny access to sensitive files
+# -----------------------------------------------
+<FilesMatch "\.(env|log|md|toml|gitignore|sql|sh|json)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+<FilesMatch "^(generate_hash|hash|db)\.php$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+# -----------------------------------------------
+# Rewrite rules
+# -----------------------------------------------
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # Allow direct access to existing files/dirs
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+
+    # Route everything else to index (if you add a router later)
+    # RewriteRule ^ index.php [QSA,L]
+</IfModule>
