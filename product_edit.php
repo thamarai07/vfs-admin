@@ -35,6 +35,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $price_per_kg = (float)$_POST['price_per_kg'];
     $discount_percent = (float)$_POST['discount_percent'];
     $unit = $_POST['unit'];
+    // Optional per-piece price. Blank => NULL => product stays single-unit exactly as before.
+    $piece_price = (isset($_POST['piece_price']) && trim($_POST['piece_price']) !== '')
+        ? (float)$_POST['piece_price'] : null;
     $min_qty = (float)$_POST['min_quantity'];
     $max_qty = (float)$_POST['max_quantity'];
     $stock = (float)$_POST['stock'];
@@ -70,20 +73,39 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (empty($error)) {
         try {
-            $sql = "UPDATE products SET 
-                    name = ?, slug = ?, category = ?, price_per_kg = ?, discount_percent = ?,
-                    unit = ?, min_quantity = ?, max_quantity = ?, stock = ?, image = ?, 
-                    description = ?, meta_title = ?, meta_description = ?, tags = ?,
-                    is_featured = ?, is_active = ?, updated_at = NOW()
-                    WHERE id = ?";
+            // `piece_price` is an additive column from the festival migration.
+            $hasPiecePrice = false;
+            try {
+                $hasPiecePrice = (bool)$conn->query("SHOW COLUMNS FROM products LIKE 'piece_price'")->fetch();
+            } catch (Exception $e) { $hasPiecePrice = false; }
 
-            $stmt = $conn->prepare($sql);
-            $stmt->execute([
-                $name, $slug, $category, $price_per_kg, $discount_percent,
-                $unit, $min_qty, $max_qty, $stock, $imageName,
-                $description, $meta_title, $meta_description, $tags,
-                $is_featured, $is_active, $id
-            ]);
+            if ($hasPiecePrice) {
+                $stmt = $conn->prepare("UPDATE products SET
+                        name = ?, slug = ?, category = ?, price_per_kg = ?, piece_price = ?, discount_percent = ?,
+                        unit = ?, min_quantity = ?, max_quantity = ?, stock = ?, image = ?,
+                        description = ?, meta_title = ?, meta_description = ?, tags = ?,
+                        is_featured = ?, is_active = ?, updated_at = NOW()
+                        WHERE id = ?");
+                $stmt->execute([
+                    $name, $slug, $category, $price_per_kg, $piece_price, $discount_percent,
+                    $unit, $min_qty, $max_qty, $stock, $imageName,
+                    $description, $meta_title, $meta_description, $tags,
+                    $is_featured, $is_active, $id
+                ]);
+            } else {
+                $stmt = $conn->prepare("UPDATE products SET
+                        name = ?, slug = ?, category = ?, price_per_kg = ?, discount_percent = ?,
+                        unit = ?, min_quantity = ?, max_quantity = ?, stock = ?, image = ?,
+                        description = ?, meta_title = ?, meta_description = ?, tags = ?,
+                        is_featured = ?, is_active = ?, updated_at = NOW()
+                        WHERE id = ?");
+                $stmt->execute([
+                    $name, $slug, $category, $price_per_kg, $discount_percent,
+                    $unit, $min_qty, $max_qty, $stock, $imageName,
+                    $description, $meta_title, $meta_description, $tags,
+                    $is_featured, $is_active, $id
+                ]);
+            }
 
             $success = "Product updated successfully!";
             // Refresh product data
@@ -192,7 +214,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                                 <div class="grid grid-cols-3 gap-4">
                                     <div>
-                                        <label class="block text-sm font-semibold text-gray-700 mb-2">Unit</label>
+                                        <label class="block text-sm font-semibold text-gray-700 mb-2">Primary Unit</label>
                                         <select name="unit" class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500">
                                             <option value="kg" <?= ($product['unit'] ?? 'kg') === 'kg' ? 'selected' : '' ?>>Per kg</option>
                                             <option value="piece" <?= ($product['unit'] ?? '') === 'piece' ? 'selected' : '' ?>>Per Piece</option>
@@ -213,6 +235,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <p class="text-xs text-red-600 mt-1">Low Stock Warning!</p>
                                         <?php endif; ?>
                                     </div>
+                                </div>
+
+                                <div class="bg-green-50 border border-green-200 rounded-xl p-4">
+                                    <label class="block text-sm font-semibold text-gray-700 mb-2">
+                                        Piece price (₹) — optional
+                                    </label>
+                                    <input type="number" step="0.01" min="0" name="piece_price"
+                                           value="<?= $product['piece_price'] ?? '' ?>"
+                                           class="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-green-500"
+                                           placeholder="Leave blank if this product is NOT sold by piece">
+                                    <p class="text-xs text-gray-500 mt-1">
+                                        Fill this in to also sell the product by piece on festival pages
+                                        (e.g. <code>Price per kg = 60</code> and <code>Piece price = 10</code>).
+                                        Blank = single unit, exactly as before.
+                                    </p>
                                 </div>
 
                                 <div class="flex gap-6">

@@ -9,7 +9,8 @@ try {
 
     if ($logo) {
         $baseUrl = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http') . "://" . $_SERVER['HTTP_HOST'];
-        $fullUrl = $baseUrl . "/vfs_portal/vfs-admin/" . $logo['logo_path'];
+
+        $fullUrl = $baseUrl . "/vfs-admin/" . $logo['logo_path'];
 
         echo json_encode([
             "status" => "success",

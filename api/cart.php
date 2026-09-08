@@ -3,61 +3,66 @@ require_once __DIR__ . '/../config/cors.php';
 header("Content-Type: application/json");
 
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
 // ----------------------------------------------------------------
-// Get user ID from session or request body/query
-// NOTE: JWT auth not implemented on frontend yet – keeping existing
-// behaviour where user_id is passed from the client.
+// Authenticate request — extract user_id from verified JWT token.
+// Client-supplied user_id values are IGNORED.
 // ----------------------------------------------------------------
-function getUserId(): int {
-    if (isset($_SESSION['user_id'])) {
-        return (int) $_SESSION['user_id'];
-    }
-
-    if (in_array($_SERVER['REQUEST_METHOD'], ['POST', 'PUT'])) {
-        // Re-read is fine here – small payload
-        $input = json_decode(file_get_contents('php://input'), true);
-        if (isset($input['user_id'])) {
-            return (int) $input['user_id'];
-        }
-    }
-
-    if (isset($_GET['user_id'])) {
-        return (int) $_GET['user_id'];
-    }
-
-    return 1; // Fallback (legacy)
-}
-
-$user_id  = getUserId();
+$authUser = requireAuth();
+$user_id  = (int) $authUser['user_id'];
 $baseUrl  = env('IMAGE_BASE_URL');
+
+// ----------------------------------------------------------------
+// Feature-detect the additive KG/Piece columns. If the festival
+// migration has NOT been run yet, every branch below transparently
+// falls back to the exact pre-feature behaviour.
+// ----------------------------------------------------------------
+$HAS_CART_UNIT = $HAS_PIECE_PRICE = false;
+try {
+    $HAS_CART_UNIT   = (bool) $conn->query("SHOW COLUMNS FROM cart LIKE 'unit'")->fetch();
+    $HAS_PIECE_PRICE = (bool) $conn->query("SHOW COLUMNS FROM products LIKE 'piece_price'")->fetch();
+} catch (Throwable $e) {
+    $HAS_CART_UNIT = $HAS_PIECE_PRICE = false;
+}
+$UNIT_ENABLED = $HAS_CART_UNIT && $HAS_PIECE_PRICE;
 
 try {
     switch ($method) {
 
         // ✅ GET - Fetch cart items
         case 'GET':
+            // Effective per-unit price: piece_price only when the buyer explicitly
+            // chose 'piece' AND the product has a piece price. Otherwise it is the
+            // exact legacy expression (p.price_per_kg) — unchanged for every row
+            // written before this feature (c.unit IS NULL).
+            $priceExpr = $UNIT_ENABLED
+                ? "CASE WHEN c.unit = 'piece' AND p.piece_price IS NOT NULL
+                        THEN p.piece_price ELSE p.price_per_kg END"
+                : "p.price_per_kg";
+            $unitCols = $HAS_CART_UNIT ? "c.unit, p.unit as product_unit," : "";
             $stmt = $conn->prepare("
                 SELECT
                     c.id as cart_id,
                     p.id,
                     p.name,
                     p.slug,
-                    p.price_per_kg as price,
+                    $priceExpr as price,
                     p.image,
                     p.category,
                     p.stock,
                     c.quantity,
+                    $unitCols
                     c.status,
                     c.last_added_at,
-                    (c.quantity * p.price_per_kg) as subtotal
+                    (c.quantity * $priceExpr) as subtotal
                 FROM cart c
                 INNER JOIN products p ON c.product_id = p.id
                 WHERE c.session_id = ?
                 AND c.status = 'active'
-                ORDER BY c.last_added_at DESC
+                ORDER BY c.created_at DESC, c.id DESC
             ");
             $stmt->execute(['user_' . $user_id]);
             $items = $stmt->fetchAll(PDO::FETCH_ASSOC);
@@ -76,6 +81,15 @@ try {
                 $item['quantity'] = (float) $item['quantity'];
                 $item['subtotal'] = (float) $item['subtotal'];
                 $item['stock']    = (int)   $item['stock'];
+
+                // Effective unit + human label (additive fields; existing rows -> 'kg')
+                $effUnit = ($item['unit'] ?? null) ?: (($item['product_unit'] ?? null) ?: 'kg');
+                $item['unit']       = $effUnit;
+                $item['unit_label'] = in_array($effUnit, ['piece', 'pieces'], true)
+                    ? 'Piece'
+                    : (in_array($effUnit, ['dozen', 'bunch', 'pack'], true) ? ucfirst($effUnit) : 'kg');
+                unset($item['product_unit']);
+
                 $total += $item['subtotal'];
             }
             unset($item);
@@ -95,10 +109,11 @@ try {
             $product_id = (int)   ($input['product_id']   ?? 0);
             $quantity   = (float) ($input['quantity']      ?? 0.25);
             $last_added = $input['last_added_at'] ?? date('Y-m-d H:i:s');
-
-            if (isset($input['user_id'])) {
-                $user_id = (int) $input['user_id'];
-            }
+            // Optional selling unit — only 'piece' is meaningful; anything else
+            // (including absent) stays NULL => legacy price_per_kg behaviour.
+            $unit       = (isset($input['unit']) && strtolower(trim((string)$input['unit'])) === 'piece')
+                            ? 'piece' : null;
+            // user_id comes from JWT — ignore any client-supplied value
 
             if ($product_id <= 0 || $quantity <= 0) {
                 http_response_code(400);
@@ -149,11 +164,17 @@ try {
                     exit;
                 }
 
-                $conn->prepare("
-                    UPDATE cart
-                    SET quantity = ?, last_added_at = ?, updated_at = NOW()
-                    WHERE id = ?
-                ")->execute([$newQty, $last_added, $existing['id']]);
+                if ($HAS_CART_UNIT) {
+                    $conn->prepare("
+                        UPDATE cart SET quantity = ?, unit = ?, last_added_at = ?, updated_at = NOW()
+                        WHERE id = ?
+                    ")->execute([$newQty, $unit, $last_added, $existing['id']]);
+                } else {
+                    $conn->prepare("
+                        UPDATE cart SET quantity = ?, last_added_at = ?, updated_at = NOW()
+                        WHERE id = ?
+                    ")->execute([$newQty, $last_added, $existing['id']]);
+                }
 
                 echo json_encode([
                     "status"   => "success",
@@ -163,10 +184,17 @@ try {
                     "user_id"  => $user_id
                 ]);
             } else {
-                $conn->prepare("
-                    INSERT INTO cart (session_id, product_id, quantity, status, last_added_at, created_at, updated_at)
-                    VALUES (?, ?, ?, 'active', ?, NOW(), NOW())
-                ")->execute([$session_id, $product_id, $quantity, $last_added]);
+                if ($HAS_CART_UNIT) {
+                    $conn->prepare("
+                        INSERT INTO cart (session_id, product_id, unit, quantity, status, last_added_at, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, 'active', ?, NOW(), NOW())
+                    ")->execute([$session_id, $product_id, $unit, $quantity, $last_added]);
+                } else {
+                    $conn->prepare("
+                        INSERT INTO cart (session_id, product_id, quantity, status, last_added_at, created_at, updated_at)
+                        VALUES (?, ?, ?, 'active', ?, NOW(), NOW())
+                    ")->execute([$session_id, $product_id, $quantity, $last_added]);
+                }
 
                 echo json_encode([
                     "status"   => "success",
@@ -184,10 +212,9 @@ try {
             $product_id = (int)   ($input['product_id']   ?? 0);
             $quantity   = (float) ($input['quantity']      ?? 0);
             $last_added = $input['last_added_at'] ?? date('Y-m-d H:i:s');
-
-            if (isset($input['user_id'])) {
-                $user_id = (int) $input['user_id'];
-            }
+            $hasUnit    = array_key_exists('unit', $input);
+            $unit       = ($hasUnit && strtolower(trim((string)$input['unit'])) === 'piece') ? 'piece' : null;
+            // user_id comes from JWT — ignore any client-supplied value
 
             if ($quantity <= 0) {
                 $conn->prepare("
@@ -210,11 +237,21 @@ try {
                 exit;
             }
 
-            $conn->prepare("
-                UPDATE cart
-                SET quantity = ?, last_added_at = ?, updated_at = NOW()
-                WHERE session_id = ? AND product_id = ? AND status = 'active'
-            ")->execute([$quantity, $last_added, 'user_' . $user_id, $product_id]);
+            // Only overwrite `unit` when the client actually sent one, so a plain
+            // quantity bump from an existing screen never clobbers the stored unit.
+            if ($HAS_CART_UNIT && $hasUnit) {
+                $conn->prepare("
+                    UPDATE cart
+                    SET quantity = ?, unit = ?, last_added_at = ?, updated_at = NOW()
+                    WHERE session_id = ? AND product_id = ? AND status = 'active'
+                ")->execute([$quantity, $unit, $last_added, 'user_' . $user_id, $product_id]);
+            } else {
+                $conn->prepare("
+                    UPDATE cart
+                    SET quantity = ?, last_added_at = ?, updated_at = NOW()
+                    WHERE session_id = ? AND product_id = ? AND status = 'active'
+                ")->execute([$quantity, $last_added, 'user_' . $user_id, $product_id]);
+            }
 
             echo json_encode(["status" => "success", "message" => "Quantity updated"]);
             break;
@@ -222,10 +259,7 @@ try {
         // ✅ DELETE - Remove from cart
         case 'DELETE':
             $product_id = (int) ($_GET['product_id'] ?? 0);
-
-            if (isset($_GET['user_id'])) {
-                $user_id = (int) $_GET['user_id'];
-            }
+            // user_id comes from JWT — ignore any client-supplied value
 
             $conn->prepare("
                 DELETE FROM cart

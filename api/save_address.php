@@ -1,156 +1,126 @@
 <?php
+/**
+ * Add Address
+ * POST /api/save_address.php   (Bearer token required)
+ *
+ * Body (JSON):
+ *   name, phoneNumber, email?, flatNo, streetAddress, area?, landmark?,
+ *   city, state, pincode, country?, label, coordinates?:{lat,lng},
+ *   isDefault?, phoneVerified?, fullAddress? (legacy fallback)
+ */
+
 require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
 
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/address_helpers.php';
 
-// Only allow POST requests
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Method not allowed. Only POST requests are accepted.'
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Method not allowed. Only POST requests are accepted.']);
     exit();
 }
 
 try {
-    // Get JSON input
-    $input = file_get_contents('php://input');
-    
-    if (empty($input)) {
-        throw new Exception('No input data received');
-    }
-    
-    $data = json_decode($input, true);
-    
-    if (json_last_error() !== JSON_ERROR_NONE) {
-        throw new Exception('Invalid JSON: ' . json_last_error_msg());
-    }
+    $data        = readJsonBody();
+    $userData    = requireAuth();
+    $customer_id = (int) $userData['user_id'];
 
-    // Validate required fields
-    $required_fields = ['customerId', 'name', 'phoneNumber', 'email', 'flatNo', 'fullAddress', 'label', 'coordinates'];
-    $missing_fields = [];
+    // ---- Validation -----------------------------------------------------
+    $name  = trim($data['name'] ?? '');
+    $phone = preg_replace('/\D/', '', (string) ($data['phoneNumber'] ?? $data['phone'] ?? ''));
+    $email = trim($data['email'] ?? '');
 
-    foreach ($required_fields as $field) {
-        if (!isset($data[$field]) || (is_string($data[$field]) && trim($data[$field]) === '')) {
-            $missing_fields[] = $field;
-        }
-    }
+    $flat_no        = trim($data['flatNo'] ?? $data['flat_no'] ?? '');
+    $street_address = trim($data['streetAddress'] ?? $data['street_address'] ?? '');
+    $area           = trim($data['area'] ?? '');
+    $landmark       = trim($data['landmark'] ?? '');
+    $city           = trim($data['city'] ?? '');
+    $state          = trim($data['state'] ?? '');
+    $pincode        = trim($data['pincode'] ?? '');
+    $country        = trim($data['country'] ?? '') ?: 'India';
+    $legacyFull     = trim($data['fullAddress'] ?? $data['full_address'] ?? '');
+    $label          = normalizeLabel($data['label'] ?? 'Home');
+    $is_default     = !empty($data['isDefault']) || !empty($data['is_default']) ? 1 : 0;
+    $phone_verified = !empty($data['phoneVerified']) || !empty($data['phone_verified']) ? 1 : 0;
 
-    if (!empty($missing_fields)) {
-        throw new Exception('Missing required fields: ' . implode(', ', $missing_fields));
-    }
+    $errors = [];
+    if ($name === '')                       $errors[] = 'Full name is required';
+    if (!preg_match('/^[0-9]{10}$/', $phone)) $errors[] = 'A valid 10-digit mobile number is required';
+    if ($email !== '' && !filter_var($email, FILTER_VALIDATE_EMAIL)) $errors[] = 'Invalid email address';
+    if ($pincode !== '' && !preg_match('/^[1-9][0-9]{5}$/', $pincode)) $errors[] = 'Invalid 6-digit pincode';
 
-    // Validate coordinates
-    if (!isset($data['coordinates']['lat']) || !isset($data['coordinates']['lng'])) {
-        throw new Exception('Invalid coordinates format');
-    }
-
-    // Extract and sanitize data
-    $customer_id = (int)$data['customerId'];
-    $name = trim($data['name']);
-    $phone = trim($data['phoneNumber']);
-    $email = trim($data['email']);
-    $flat_no = trim($data['flatNo']);
-    $landmark = isset($data['landmark']) && !empty(trim($data['landmark'])) ? trim($data['landmark']) : null;
-    $full_address = trim($data['fullAddress']);
-    $label = trim($data['label']);
-    $latitude = (float)$data['coordinates']['lat'];
-    $longitude = (float)$data['coordinates']['lng'];
-    $is_default = isset($data['isDefault']) && $data['isDefault'] ? 1 : 0;
-
-    // Validate label
-    if (!in_array($label, ['Home', 'Work', 'Other'])) {
-        throw new Exception('Invalid label. Must be Home, Work, or Other.');
+    // Need either structured street info or a legacy full address line.
+    if ($street_address === '' && $legacyFull === '' && $flat_no === '') {
+        $errors[] = 'Address details are required';
     }
 
-    // Verify customer exists
-    $stmt = $conn->prepare("SELECT id FROM customers WHERE id = ?");
-    $stmt->execute([$customer_id]);
-    
-    if ($stmt->rowCount() === 0) {
-        throw new Exception('Customer not found');
+    if (!empty($errors)) {
+        http_response_code(422);
+        echo json_encode(['success' => false, 'message' => implode('. ', $errors), 'errors' => $errors]);
+        exit();
     }
 
-    // Start transaction
+    // Coordinates (optional)
+    $latitude  = isset($data['coordinates']['lat']) ? (float) $data['coordinates']['lat'] : null;
+    $longitude = isset($data['coordinates']['lng']) ? (float) $data['coordinates']['lng'] : null;
+
+    // Compose the single-line address (used by orders / legacy views).
+    $full_address = $legacyFull !== '' ? $legacyFull : composeFullAddress([
+        'flat_no'        => $flat_no,
+        'street_address' => $street_address,
+        'area'           => $area,
+        'landmark'       => $landmark,
+        'city'           => $city,
+        'state'          => $state,
+        'pincode'        => $pincode,
+        'country'        => $country,
+    ]);
+
+    // ---- Persist --------------------------------------------------------
     $conn->beginTransaction();
 
-    // If this address is set as default, unset others
     if ($is_default) {
-        $stmt = $conn->prepare("UPDATE customer_addresses SET is_default = 0 WHERE customer_id = ?");
-        $stmt->execute([$customer_id]);
+        $conn->prepare("UPDATE customer_addresses SET is_default = 0 WHERE customer_id = ?")
+             ->execute([$customer_id]);
     }
 
-    // Insert new address
-    $sql = "INSERT INTO customer_addresses 
-            (customer_id, name, phone, email, flat_no, landmark, full_address, label, latitude, longitude, is_default, created_at, updated_at) 
-            VALUES 
-            (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())";
+    $sql = "INSERT INTO customer_addresses
+            (customer_id, name, phone, email, flat_no, street_address, area, landmark,
+             city, state, pincode, country, full_address, label, latitude, longitude,
+             is_default, phone_verified, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())";
 
     $stmt = $conn->prepare($sql);
     $stmt->execute([
-        $customer_id,
-        $name,
-        $phone,
-        $email,
-        $flat_no,
-        $landmark,
-        $full_address,
-        $label,
-        $latitude,
-        $longitude,
-        $is_default
+        $customer_id, $name, $phone, ($email ?: null), $flat_no, $street_address, $area, $landmark,
+        $city, $state, $pincode, $country, $full_address, $label, $latitude, $longitude,
+        $is_default, $phone_verified,
     ]);
 
-    $address_id = $conn->lastInsertId();
+    $address_id = (int) $conn->lastInsertId();
 
-    // Fetch the inserted address
     $stmt = $conn->prepare("SELECT * FROM customer_addresses WHERE id = ?");
     $stmt->execute([$address_id]);
-    $address = $stmt->fetch(PDO::FETCH_ASSOC);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$address) {
-        throw new Exception('Failed to retrieve saved address');
-    }
-
-    // Commit transaction
     $conn->commit();
 
-    // Format response
-    $response = [
+    http_response_code(201);
+    echo json_encode([
         'success' => true,
         'message' => 'Address saved successfully',
-        'data' => [
-            'id' => (int)$address['id'],
-            'customer_id' => (int)$address['customer_id'],
-            'name' => $address['name'],
-            'phone' => $address['phone'],
-            'email' => $address['email'],
-            'flat_no' => $address['flat_no'],
-            'landmark' => $address['landmark'],
-            'full_address' => $address['full_address'],
-            'label' => $address['label'],
-            'latitude' => (float)$address['latitude'],
-            'longitude' => (float)$address['longitude'],
-            'is_default' => (int)$address['is_default'],
-            'created_at' => $address['created_at'],
-            'updated_at' => $address['updated_at']
-        ]
-    ];
-
-    http_response_code(201);
-    echo json_encode($response);
+        'data'    => formatAddressRow($row),
+    ]);
 
 } catch (Exception $e) {
     if (isset($conn) && $conn->inTransaction()) {
         $conn->rollBack();
     }
-    error_log("save_address.php Error: " . $e->getMessage());
+    error_log('save_address.php Error: ' . $e->getMessage());
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => 'An error occurred while saving the address. Please try again.'
-    ]);
+    // NOTE: exposes the DB error to help diagnose (e.g. a missing column). Once the
+    // address columns exist, you can revert this to a generic message.
+    echo json_encode(['success' => false, 'message' => 'Save failed: ' . $e->getMessage()]);
 }
-?>

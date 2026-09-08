@@ -4,16 +4,8 @@
  * File: create_order.php
  */
 
+require_once __DIR__ . '/../config/cors.php';  // Handles CORS + OPTIONS preflight
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
-
-// Handle preflight request
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
 
 // Only allow POST requests
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -24,17 +16,19 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 // Database connection
 require_once('../config/db.php');
+require_once('../config/jwt.php');
+
+// Authenticate — customerId comes from token, NOT from client body
+$authUser   = requireAuth();
+$customerId = (int) $authUser['user_id'];
 
 try {
     // Get JSON input
     $input = file_get_contents('php://input');
     $data = json_decode($input, true);
 
-    // Log received data for debugging
-    error_log("Received order data: " . print_r($data, true));
-
-    // Validate required fields
-    if (!isset($data['customerId']) || !isset($data['items']) || !isset($data['address']) || !isset($data['total'])) {
+    // Validate required fields (customerId now comes from JWT — not required in body)
+    if (!isset($data['items']) || !isset($data['address']) || !isset($data['total'])) {
         throw new Exception('Missing required fields');
     }
 
@@ -43,11 +37,10 @@ try {
         throw new Exception('Cart is empty or invalid');
     }
 
-    // Extract data
-    $customerId = intval($data['customerId']);
-    $items = $data['items'];
-    $address = $data['address'];
-    $notes = isset($data['notes']) ? trim($data['notes']) : '';
+    // Extract data (customerId already set from JWT above)
+    $items         = $data['items'];
+    $address       = $data['address'];
+    $notes         = isset($data['notes']) ? trim($data['notes']) : '';
     $paymentMethod = isset($data['paymentMethod']) ? $data['paymentMethod'] : 'cod';
 
     // Calculate totals
@@ -90,15 +83,22 @@ try {
     $customerName = $address['name'];
     $customerPhone = $address['phoneNumber'];
 
-    // Build full address string
+    // Build full address string from whatever structured parts were sent.
+    // Falls back gracefully to the legacy `fullAddress` line.
+    $addressKeys = ['flatNo', 'streetAddress', 'area', 'landmark', 'city', 'state', 'pincode', 'country'];
     $addressParts = [];
-    if (isset($address['flatNo']) && !empty($address['flatNo'])) {
-        $addressParts[] = $address['flatNo'];
+    foreach ($addressKeys as $key) {
+        if (isset($address[$key]) && trim((string) $address[$key]) !== '') {
+            $part = trim((string) $address[$key]);
+            $addressParts[] = ($key === 'landmark') ? ('Near ' . $part) : $part;
+        }
     }
-    if (isset($address['landmark']) && !empty($address['landmark'])) {
-        $addressParts[] = $address['landmark'];
+    if (empty($addressParts) && !empty($address['fullAddress'])) {
+        $addressParts[] = $address['fullAddress'];
+    } elseif (!empty($address['fullAddress']) && empty($address['streetAddress'])) {
+        // legacy callers only send fullAddress (+ flatNo/landmark)
+        $addressParts[] = $address['fullAddress'];
     }
-    $addressParts[] = $address['fullAddress'];
     $customerAddress = implode(', ', $addressParts);
 
     // Insert order into orders table
@@ -126,15 +126,23 @@ try {
 
     $orderId = $conn->lastInsertId();
 
-    // Insert order items
-    $itemStmt = $conn->prepare("
-        INSERT INTO order_items (
-            order_id, product_id, product_name, quantity, price, subtotal
-        ) VALUES (?, ?, ?, ?, ?, ?)
-    ");
+    // Insert order items.
+    // `unit` is an additive nullable column — only used when the festival
+    // migration has been run; otherwise this behaves exactly as before.
+    $hasItemUnit = false;
+    try {
+        $hasItemUnit = (bool) $conn->query("SHOW COLUMNS FROM order_items LIKE 'unit'")->fetch();
+    } catch (Throwable $e) {
+        $hasItemUnit = false;
+    }
+
+    $itemStmt = $hasItemUnit
+        ? $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, unit, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        : $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?)");
 
     // Collect product IDs from order items
     $orderedProductIds = [];
+    $invoiceItems = []; // for the confirmation email
 
     foreach ($items as $item) {
         $productId = intval($item['id']);
@@ -142,18 +150,23 @@ try {
         $quantity = floatval($item['quantity']);
         $price = floatval($item['price']);
         $itemSubtotal = floatval($item['subtotal']);
+        $unit = (isset($item['unit']) && strtolower(trim((string)$item['unit'])) === 'piece') ? 'piece' : null;
 
-        $itemStmt->execute([
-            $orderId,
-            $productId,
-            $productName,
-            $quantity,
-            $price,
-            $itemSubtotal
-        ]);
+        $itemStmt->execute($hasItemUnit
+            ? [$orderId, $productId, $productName, $unit, $quantity, $price, $itemSubtotal]
+            : [$orderId, $productId, $productName, $quantity, $price, $itemSubtotal]
+        );
 
         // Track product IDs for wishlist update
         $orderedProductIds[] = $productId;
+
+        $invoiceItems[] = [
+            'name'     => $productName,
+            'unit'     => $unit,
+            'quantity' => $quantity,
+            'price'    => $price,
+            'subtotal' => $itemSubtotal,
+        ];
     }
 
     // Insert status history (if you have this table)
@@ -214,6 +227,38 @@ try {
     // Commit transaction
     $conn->commit();
 
+    // ── Email the customer a neat invoice (best-effort, never blocks the order) ──
+    $invoiceEmailed = false;
+    try {
+        $custStmt = $conn->prepare("SELECT email, name FROM customers WHERE id = ?");
+        $custStmt->execute([$customerId]);
+        $cust = $custStmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($cust && !empty($cust['email'])) {
+            require_once __DIR__ . '/../includes/invoice_email.php';
+            $invoiceEmailed = sendOrderInvoiceEmail(
+                $cust['email'],
+                $cust['name'] ?? $customerName,
+                [
+                    'order_number'     => $orderNumber,
+                    'created_at'       => date('Y-m-d H:i:s'),
+                    'customer_name'    => $customerName,
+                    'customer_phone'   => $customerPhone,
+                    'customer_address' => $customerAddress,
+                    'subtotal'         => $subtotal,
+                    'tax'              => $tax,
+                    'shipping_charge'  => $shippingCharge,
+                    'total_amount'     => $totalAmount,
+                    'payment_method'   => $paymentMethod,
+                    'notes'            => $notes,
+                ],
+                $invoiceItems
+            );
+        }
+    } catch (\Throwable $e) {
+        error_log("[create_order] invoice email skipped: " . $e->getMessage());
+    }
+
     // Send success response
     echo json_encode([
         'success' => true,
@@ -224,9 +269,10 @@ try {
             'totalAmount' => $totalAmount,
             'paymentMethod' => $paymentMethod,
             'orderStatus' => 'pending',
-            'cartMarkedAsOrdered' => true, 
+            'cartMarkedAsOrdered' => true,
             'itemsMarked' => $markedCartItems,
-            'wishlistItemsMarked' => $markedWishlistItems // NEW: Track wishlist updates
+            'wishlistItemsMarked' => $markedWishlistItems, // NEW: Track wishlist updates
+            'invoiceEmailed' => $invoiceEmailed
         ]
     ]);
 

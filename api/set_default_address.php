@@ -1,80 +1,61 @@
 <?php
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+/**
+ * Set Default Address
+ * POST /api/set_default_address.php   (Bearer token required)
+ * Body: { "id": <addressId> }  (also accepts "addressId")
+ */
+
+require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
 
-// Handle preflight OPTIONS request
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
-
-require_once('../config/db.php');
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/address_helpers.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Method not allowed'
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Method not allowed']);
     exit();
 }
-
-$input = file_get_contents('php://input');
-$data = json_decode($input, true);
-
-$address_id = isset($data['addressId']) ? intval($data['addressId']) : 0;
-$customer_id = isset($data['customerId']) ? intval($data['customerId']) : 0;
-
-if ($address_id <= 0 || $customer_id <= 0) {
-    http_response_code(400);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Valid address ID and customer ID required'
-    ]);
-    exit();
-}
-
-mysqli_begin_transaction($conn);
 
 try {
-    // Verify address belongs to customer
-    $verify = "SELECT id FROM customer_addresses WHERE id = $address_id AND customer_id = $customer_id";
-    $verify_result = mysqli_query($conn, $verify);
-    
-    if (mysqli_num_rows($verify_result) === 0) {
-        throw new Exception('Address not found or does not belong to customer');
+    $data        = readJsonBody();
+    $userData    = requireAuth();
+    $customer_id = (int) $userData['user_id'];
+
+    $address_id = (int) ($data['addressId'] ?? $data['id'] ?? 0);
+    if ($address_id <= 0) {
+        http_response_code(400);
+        echo json_encode(['success' => false, 'message' => 'Valid address ID required']);
+        exit();
     }
 
-    // Unset all defaults for this customer
-    $unset_query = "UPDATE customer_addresses SET is_default = 0 WHERE customer_id = $customer_id";
-    if (!mysqli_query($conn, $unset_query)) {
-        throw new Exception('Failed to unset defaults');
+    // Verify the address belongs to this customer (parameterised — no SQL injection)
+    $verify = $conn->prepare("SELECT id FROM customer_addresses WHERE id = ? AND customer_id = ?");
+    $verify->execute([$address_id, $customer_id]);
+    if ($verify->rowCount() === 0) {
+        http_response_code(404);
+        echo json_encode(['success' => false, 'message' => 'Address not found or does not belong to customer']);
+        exit();
     }
 
-    // Set new default
-    $set_query = "UPDATE customer_addresses SET is_default = 1, updated_at = NOW() WHERE id = $address_id";
-    if (!mysqli_query($conn, $set_query)) {
-        throw new Exception('Failed to set default address');
-    }
+    $conn->beginTransaction();
 
-    mysqli_commit($conn);
+    $conn->prepare("UPDATE customer_addresses SET is_default = 0 WHERE customer_id = ?")
+         ->execute([$customer_id]);
 
-    echo json_encode([
-        'success' => true,
-        'message' => 'Default address updated successfully'
-    ]);
+    $conn->prepare("UPDATE customer_addresses SET is_default = 1, updated_at = NOW() WHERE id = ? AND customer_id = ?")
+         ->execute([$address_id, $customer_id]);
+
+    $conn->commit();
+
+    echo json_encode(['success' => true, 'message' => 'Default address updated successfully']);
 
 } catch (Exception $e) {
-    mysqli_rollback($conn);
-    
+    if (isset($conn) && $conn->inTransaction()) {
+        $conn->rollBack();
+    }
+    error_log('set_default_address.php Error: ' . $e->getMessage());
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Failed to update default address. Please try again.']);
 }
-
-mysqli_close($conn);
-?>

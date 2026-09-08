@@ -1,76 +1,73 @@
 <?php
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: DELETE, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+/**
+ * Delete Address
+ * POST | DELETE  /api/delete_address.php   (Bearer token required)
+ * Body: { "id": <addressId> }  (also accepts "addressId")
+ */
+
+require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
 
-// Handle preflight OPTIONS request
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/address_helpers.php';
 
-require_once('../config/db.php');
-
-if ($_SERVER['REQUEST_METHOD'] !== 'POST' && $_SERVER['REQUEST_METHOD'] !== 'DELETE') {
+if (!in_array($_SERVER['REQUEST_METHOD'], ['POST', 'DELETE'], true)) {
     http_response_code(405);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Method not allowed'
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Method not allowed']);
     exit();
 }
 
 try {
-    $input = file_get_contents('php://input');
-    $data = json_decode($input, true);
+    $data        = readJsonBody();
+    $userData    = requireAuth();
+    $customer_id = (int) $userData['user_id'];
 
-    $address_id = isset($data['addressId']) ? intval($data['addressId']) : 0;
-    $customer_id = isset($data['customerId']) ? intval($data['customerId']) : 0;
-
-    if ($address_id <= 0 || $customer_id <= 0) {
+    $address_id = (int) ($data['addressId'] ?? $data['id'] ?? 0);
+    if ($address_id <= 0) {
         http_response_code(400);
-        echo json_encode([
-            'success' => false,
-            'message' => 'Valid address ID and customer ID required'
-        ]);
+        echo json_encode(['success' => false, 'message' => 'Valid address ID required']);
         exit();
     }
 
-    // Verify address belongs to customer
-    $verify = $conn->prepare("SELECT id FROM customer_addresses WHERE id = ? AND customer_id = ?");
+    // Ownership check
+    $verify = $conn->prepare("SELECT is_default FROM customer_addresses WHERE id = ? AND customer_id = ?");
     $verify->execute([$address_id, $customer_id]);
+    $row = $verify->fetch(PDO::FETCH_ASSOC);
 
-    if ($verify->rowCount() === 0) {
+    if (!$row) {
         http_response_code(404);
-        echo json_encode([
-            'success' => false,
-            'message' => 'Address not found or does not belong to customer'
-        ]);
+        echo json_encode(['success' => false, 'message' => 'Address not found or does not belong to customer']);
         exit();
     }
 
-    // Delete the address
-    $delete_query = $conn->prepare("DELETE FROM customer_addresses WHERE id = ?");
-    
-    if ($delete_query->execute([$address_id])) {
-        echo json_encode([
-            'success' => true,
-            'message' => 'Address deleted successfully'
-        ]);
-    } else {
-        http_response_code(500);
-        echo json_encode([
-            'success' => false,
-            'message' => 'Failed to delete address'
-        ]);
+    $conn->beginTransaction();
+
+    $conn->prepare("DELETE FROM customer_addresses WHERE id = ? AND customer_id = ?")
+         ->execute([$address_id, $customer_id]);
+
+    // If we removed the default address, promote the most recent remaining one.
+    if ((int) $row['is_default'] === 1) {
+        $next = $conn->prepare(
+            "SELECT id FROM customer_addresses WHERE customer_id = ?
+             ORDER BY updated_at DESC, created_at DESC LIMIT 1"
+        );
+        $next->execute([$customer_id]);
+        if ($nextId = $next->fetchColumn()) {
+            $conn->prepare("UPDATE customer_addresses SET is_default = 1 WHERE id = ?")
+                 ->execute([$nextId]);
+        }
     }
 
-} catch (PDOException $e) {
+    $conn->commit();
+
+    echo json_encode(['success' => true, 'message' => 'Address deleted successfully']);
+
+} catch (Exception $e) {
+    if (isset($conn) && $conn->inTransaction()) {
+        $conn->rollBack();
+    }
+    error_log('delete_address.php Error: ' . $e->getMessage());
     http_response_code(500);
-    echo json_encode([
-        'success' => false,
-        'message' => 'Database error: ' . $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => 'Failed to delete address. Please try again.']);
 }
-?>

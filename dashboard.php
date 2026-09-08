@@ -112,6 +112,10 @@ try {
                 <i class="fas fa-shopping-cart w-5"></i>
                 <span class="font-medium">Orders</span>
             </a>
+            <a href="festivals.php" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-gray-700 transition">
+                <i class="fas fa-gifts w-5"></i>
+                <span class="font-medium">Festivals</span>
+            </a>
             <a href="customers.php" class="flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-gray-700 transition">
                 <i class="fas fa-users w-5"></i>
                 <span class="font-medium">Customers</span>

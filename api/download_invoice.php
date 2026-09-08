@@ -5,6 +5,7 @@
  */
 
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../includes/invoice_email.php'; // invoiceFormatQty() helper
 
 $order_id    = isset($_GET['order_id'])    ? (int) $_GET['order_id']    : null;
 $customer_id = isset($_GET['customer_id']) ? (int) $_GET['customer_id'] : null;
@@ -217,7 +218,7 @@ function generateInvoiceHTML(array $order, array $items): string {
                             <td class="text-center"><?= $index + 1 ?></td>
                             <td><strong><?= htmlspecialchars($item['product_name'] ?? $item['name'] ?? '') ?></strong></td>
                             <td class="text-right">₹<?= number_format((float)($item['price'] ?? $item['price_per_kg'] ?? 0), 2) ?></td>
-                            <td class="text-right"><?= $item['quantity'] ?> kg</td>
+                            <td class="text-right"><?= htmlspecialchars(invoiceFormatQty((float)($item['quantity'] ?? 0), $item['unit'] ?? null)) ?></td>
                             <td class="text-right"><strong>₹<?= number_format((float)$item['subtotal'], 2) ?></strong></td>
                         </tr>
                     <?php endforeach; ?>

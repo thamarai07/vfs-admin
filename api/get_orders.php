@@ -66,8 +66,10 @@ try {
         $orderId = $order['id'];
 
         // ---- Fetch order items via PDO ----
+        // `unit` is an additive column (festival migration); select oi.* so it
+        // comes through when present and is simply absent otherwise.
         $itemsStmt = $conn->prepare("
-            SELECT id, product_id, product_name, price, quantity, subtotal
+            SELECT *
             FROM order_items
             WHERE order_id = ?
         ");
@@ -80,7 +82,8 @@ try {
             'name'      => $item['product_name'],
             'price'     => (float) ($item['price'] ?? 0),
             'quantity'  => (float) $item['quantity'],
-            'subtotal'  => (float) $item['subtotal']
+            'subtotal'  => (float) $item['subtotal'],
+            'unit'      => $item['unit'] ?? null
         ], $rawItems);
 
         $orders[] = [

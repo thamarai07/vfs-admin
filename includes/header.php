@@ -74,6 +74,10 @@ try {
                 <i class="fas fa-shopping-cart w-5"></i>
                 <span class="font-medium">Orders</span>
             </a>
+            <a href="festivals.php" class="<?= in_array(basename($_SERVER['PHP_SELF']), ['festivals.php','festival_add.php','festival_edit.php']) ? 'sidebar-active' : '' ?> flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-gray-700 transition">
+                <i class="fas fa-gifts w-5"></i>
+                <span class="font-medium">Festivals</span>
+            </a>
             <a href="customers.php" class="<?= basename($_SERVER['PHP_SELF']) == 'customers.php' ? 'sidebar-active' : '' ?> flex items-center gap-3 px-4 py-3 rounded-lg hover:bg-gray-700 transition">
                 <i class="fas fa-users w-5"></i>
                 <span class="font-medium">Customers</span>

@@ -21,27 +21,14 @@ try {
         exit;
     }
 
-    // 🔥 Get user_id from query parameter
-    $user_id = isset($_GET['user_id']) ? intval($_GET['user_id']) : null;
-    
-    // If no user_id provided, try session (fallback)
-    if (!$user_id) {
-        session_start();
-        $user_id = $_SESSION['user_id'] ?? 1;  // Default to 1 for backward compatibility
-    }
-    
-    // Validate user_id
-    if (empty($user_id) || $user_id < 1) {
-        echo json_encode([
-            "status" => "success",
-            "count" => 0,
-            "message" => "No user specified",
-            "user_id" => null
-        ]);
-        exit;
-    }
+    require_once __DIR__ . '/../config/jwt.php';
+
+    // user_id comes from the verified JWT — never from the client.
+    $authUser = requireAuth();
+    $user_id  = (int) ($authUser['user_id'] ?? 0);
 
     $session_id = 'user_' . $user_id;
+
     
     error_log("🔍 Getting cart count for user_id: $user_id (session: $session_id)");
 
@@ -63,13 +50,26 @@ try {
     $totalValue = round((float) $result['total_value'], 2);
     
     error_log("✅ Cart count for user $user_id: $count items, total value: ₹$totalValue");
-    
-    echo json_encode([
+
+    $response = [
         "status"      => "success",
         "count"       => $count,
         "total_value" => $totalValue,
         "user_id"     => $user_id
-    ]);
+    ];
+
+    if (isset($_GET['debug'])) {   // add ?debug=1 to the URL to see internals
+        $sample = $conn->prepare("SELECT id, session_id, product_id, quantity, status FROM cart WHERE session_id = ? LIMIT 5");
+        $sample->execute([$session_id]);
+        $response['debug'] = [
+            "resolved_user_id" => $user_id,
+            "session_id"       => $session_id,
+            "jwt_payload"      => $authUser,
+            "sample_rows"      => $sample->fetchAll(PDO::FETCH_ASSOC),
+        ];
+    }
+
+    echo json_encode($response);
 
 } catch (PDOException $e) {
     // Database errors
