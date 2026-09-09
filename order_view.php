@@ -1,6 +1,7 @@
 <?php
 session_start();
 require_once "config/db.php";
+require_once __DIR__ . '/includes/invoice_email.php'; // invoiceFormatQty()
 
 if (!isset($_SESSION['admin_id'])) {
     header("Location: login.php");
@@ -100,7 +101,7 @@ $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
                                     <?php foreach ($items as $item): ?>
                                     <tr>
                                         <td class="px-4 py-3 font-medium text-gray-900"><?= htmlspecialchars($item['product_name']) ?></td>
-                                        <td class="px-4 py-3 text-right"><?= number_format($item['quantity'], 2) ?> kg</td>
+                                        <td class="px-4 py-3 text-right"><?= htmlspecialchars(invoiceFormatQty((float)($item['quantity'] ?? 0), $item['unit'] ?? null)) ?></td>
                                         <td class="px-4 py-3 text-right">₹<?= number_format($item['price'], 2) ?></td>
                                         <td class="px-4 py-3 text-right font-semibold">₹<?= number_format($item['subtotal'], 2) ?></td>
                                     </tr>
@@ -181,6 +182,20 @@ $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
                             <div>
                                 <p class="text-sm text-gray-500 mb-1">Payment Method</p>
                                 <p class="font-semibold capitalize"><?= htmlspecialchars($order['payment_method']) ?></p>
+                            </div>
+
+                            <div>
+                                <p class="text-sm text-gray-500 mb-1">Invoice Email</p>
+                                <?php if (!empty($order['invoice_emailed_at'])): ?>
+                                    <span class="px-3 py-1 rounded-full text-sm font-semibold bg-green-100 text-green-800">
+                                        <i class="fas fa-paper-plane mr-1"></i>Sent
+                                    </span>
+                                    <p class="text-xs text-gray-400 mt-1"><?= htmlspecialchars(date('d M Y, g:i A', strtotime($order['invoice_emailed_at']))) ?></p>
+                                <?php elseif (array_key_exists('invoice_emailed_at', $order)): ?>
+                                    <span class="px-3 py-1 rounded-full text-sm font-semibold bg-gray-100 text-gray-600">Not sent</span>
+                                <?php else: ?>
+                                    <span class="text-xs text-gray-400">tracking not enabled</span>
+                                <?php endif; ?>
                             </div>
                         </div>
                     </div>

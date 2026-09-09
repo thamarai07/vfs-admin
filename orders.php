@@ -56,9 +56,18 @@ $count_stmt->execute();
 $total_orders = $count_stmt->fetchColumn();
 $total_pages = ceil($total_orders / $limit);
 
+// `invoice_emailed_at` is an additive column (invoice-email migration).
+// Only select it when it exists so this page can't fatal before the migration.
+$hasInvoiceEmailedCol = false;
+try {
+    $hasInvoiceEmailedCol = (bool) $conn->query("SHOW COLUMNS FROM orders LIKE 'invoice_emailed_at'")->fetch();
+} catch (Throwable $e) {
+    $hasInvoiceEmailedCol = false;
+}
+
 // Get orders
 $query = "
-    SELECT 
+    SELECT
         o.id,
         o.order_number,
         o.customer_id,
@@ -75,6 +84,7 @@ $query = "
         o.delivery_date,
         o.notes,
         o.created_at,
+        " . ($hasInvoiceEmailedCol ? "o.invoice_emailed_at," : "") . "
         COUNT(oi.id) as item_count
     FROM orders o
     LEFT JOIN order_items oi ON o.id = oi.order_id
@@ -388,7 +398,12 @@ include('includes/header.php');
                                 <tr>
                                     <td>
                                         <div style="padding: 10px;">
-                                            <h6 style="margin: 0; font-size: 15px;"><?= htmlspecialchars($order['order_number']) ?></h6>
+                                            <h6 style="margin: 0; font-size: 15px;">
+                                                <?= htmlspecialchars($order['order_number']) ?>
+                                                <?php if (!empty($order['invoice_emailed_at'])): ?>
+                                                    <i class="fas fa-paper-plane" style="color:#16a34a;font-size:11px;margin-left:4px;" title="Invoice email sent <?= htmlspecialchars($order['invoice_emailed_at']) ?>"></i>
+                                                <?php endif; ?>
+                                            </h6>
                                         </div>
                                     </td>
                                     <td>

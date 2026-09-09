@@ -49,6 +49,46 @@ if (!function_exists('invoiceStoreInfo')) {
     }
 }
 
+if (!function_exists('buildOrderInvoiceText')) {
+    /** Plain-text version of the invoice (for the multipart/alternative part). */
+    function buildOrderInvoiceText(array $order, array $items, array $store): string
+    {
+        $l = [];
+        $l[] = $store['name'] . ' — Order Invoice';
+        $l[] = str_repeat('-', 40);
+        $l[] = 'Order:   ' . ($order['order_number'] ?? '');
+        $l[] = 'Date:    ' . date('d M Y, g:i A', strtotime($order['created_at'] ?? 'now'));
+        $l[] = 'Payment: ' . strtoupper($order['payment_method'] ?? 'COD');
+        $l[] = '';
+        $l[] = 'Deliver to: ' . ($order['customer_name'] ?? '');
+        $l[] = '  ' . ($order['customer_address'] ?? '');
+        $l[] = '  ' . ($order['customer_phone'] ?? '');
+        $l[] = '';
+        $l[] = 'ITEMS';
+        foreach ($items as $it) {
+            $qty = (float) ($it['quantity'] ?? 0);
+            $l[] = sprintf('  %-22s %8s x Rs %-8s = Rs %s',
+                substr($it['name'] ?? '', 0, 22),
+                invoiceFormatQty($qty, $it['unit'] ?? null),
+                number_format((float) ($it['price'] ?? 0), 2),
+                number_format((float) ($it['subtotal'] ?? 0), 2));
+        }
+        $l[] = '';
+        $l[] = 'Subtotal:  Rs ' . number_format((float) ($order['subtotal'] ?? 0), 2);
+        $l[] = 'Tax (8%):  Rs ' . number_format((float) ($order['tax'] ?? 0), 2);
+        $sh = (float) ($order['shipping_charge'] ?? 0);
+        $l[] = 'Shipping:  ' . ($sh > 0 ? 'Rs ' . number_format($sh, 2) : 'FREE');
+        $l[] = 'TOTAL:     Rs ' . number_format((float) ($order['total_amount'] ?? $order['total'] ?? 0), 2);
+        if (!empty($order['notes'])) {
+            $l[] = '';
+            $l[] = 'Note: ' . $order['notes'];
+        }
+        $l[] = '';
+        $l[] = 'Thank you for your order! - ' . $store['name'];
+        return implode("\r\n", $l);
+    }
+}
+
 if (!function_exists('buildOrderInvoiceHtml')) {
     /**
      * @param array $order  order_number, created_at, customer_name, customer_phone,
@@ -179,68 +219,118 @@ if (!function_exists('sendOrderInvoiceEmail')) {
     /**
      * Send the invoice. Returns true on success, false on any failure (logged).
      * Never throws.
+     *
+     * Delivery path — same strategy api/forgot_password.php uses:
+     *   1. PHPMailer over SMTP   (if vendor/ present AND SMTP_* env set)
+     *   2. PHP mail()            (fallback — what actually works on the current host)
      */
-    function sendOrderInvoiceEmail(string $toEmail, string $toName, array $order, array $items): bool
+    function sendOrderInvoiceEmail(string $toEmail, string $toName, array $order, array $items, array $bcc = []): bool
     {
         try {
             $toEmail = trim($toEmail);
             if ($toEmail === '' || !filter_var($toEmail, FILTER_VALIDATE_EMAIL)) {
+                error_log('[invoice_email] invalid recipient: ' . $toEmail);
                 return false;
             }
+            $bcc = array_values(array_filter(array_map('trim', $bcc),
+                fn($b) => $b !== '' && filter_var($b, FILTER_VALIDATE_EMAIL)
+                          && strcasecmp($b, $toEmail) !== 0));
 
-            $autoload = __DIR__ . '/../vendor/autoload.php';
-            $manual   = __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
-            if (file_exists($autoload)) {
-                require_once $autoload;
-            } elseif (file_exists($manual)) {
-                require_once __DIR__ . '/../vendor/PHPMailer/src/Exception.php';
-                require_once __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
-                require_once __DIR__ . '/../vendor/PHPMailer/src/SMTP.php';
-            } else {
-                error_log('[invoice_email] PHPMailer not found');
-                return false;
-            }
+            $store   = invoiceStoreInfo();
+            $subject = 'Your ' . $store['name'] . ' order ' . ($order['order_number'] ?? '');
+            $html    = buildOrderInvoiceHtml($order, $items, $store);
+            $orderNo = $order['order_number'] ?? '';
 
             $smtpHost = $_ENV['SMTP_HOST'] ?? getenv('SMTP_HOST') ?: '';
             $smtpUser = $_ENV['SMTP_USER'] ?? getenv('SMTP_USER') ?: '';
             $smtpPass = $_ENV['SMTP_PASS'] ?? getenv('SMTP_PASS') ?: '';
-            $mailFrom = $_ENV['MAIL_FROM'] ?? getenv('MAIL_FROM') ?: $smtpUser;
 
-            if ($smtpHost === '' || $smtpUser === '' || $smtpPass === '') {
-                error_log('[invoice_email] SMTP not configured — skipping invoice email');
-                return false;
+            // Sender: MAIL_FROM env, else no-reply@<your real domain> (from
+            // STORE_WEBSITE, e.g. rooto.in) — the SAME kind of address
+            // forgot_password.php's working mail() uses. Never STORE_EMAIL,
+            // which is a placeholder in .env.
+            $siteDomain = strtolower(preg_replace('#^https?://|/.*$|^www\.#', '', $store['website'] ?: 'rooto.in'));
+            if ($siteDomain === '' || strpos($siteDomain, '.') === false) $siteDomain = 'rooto.in';
+            $mailFrom   = ($_ENV['MAIL_FROM'] ?? getenv('MAIL_FROM')) ?: ('no-reply@' . $siteDomain);
+
+            $autoload = __DIR__ . '/../vendor/autoload.php';
+            $manual   = __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
+            $havePhpMailer = file_exists($autoload) || file_exists($manual);
+
+            // ── Path 1: PHPMailer + SMTP ────────────────────────────────────
+            if ($havePhpMailer && $smtpHost !== '' && $smtpUser !== '' && $smtpPass !== '') {
+                if (file_exists($autoload)) {
+                    require_once $autoload;
+                } else {
+                    require_once __DIR__ . '/../vendor/PHPMailer/src/Exception.php';
+                    require_once __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
+                    require_once __DIR__ . '/../vendor/PHPMailer/src/SMTP.php';
+                }
+
+                $mail = new PHPMailer\PHPMailer\PHPMailer(true);
+                $mail->isSMTP();
+                $mail->Host       = $smtpHost;
+                $mail->SMTPAuth   = true;
+                $mail->Username   = $smtpUser;
+                $mail->Password   = $smtpPass;
+                $mail->SMTPSecure = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+                $mail->Port       = 587;
+                $mail->CharSet    = 'UTF-8';
+                $mail->setFrom($mailFrom, $store['name']);
+                $mail->addAddress($toEmail, $toName !== '' ? $toName : $toEmail);
+                foreach ($bcc as $b) { $mail->addBCC($b); }
+                if (!empty($store['email'])) {
+                    $mail->addReplyTo($store['email'], $store['name'] . ' Support');
+                }
+                $mail->isHTML(true);
+                $mail->Subject = $subject;
+                $mail->Body    = $html;
+                $mail->AltBody = "Order $orderNo — total Rs "
+                    . number_format((float) ($order['total_amount'] ?? 0), 2)
+                    . ". Thank you for your order! - " . $store['name'];
+                $mail->send();
+                error_log("[invoice_email] sent via SMTP to $toEmail for $orderNo");
+                return true;
             }
 
-            $store = invoiceStoreInfo();
-            $html  = buildOrderInvoiceHtml($order, $items, $store);
-            $text  = "Order " . ($order['order_number'] ?? '') . "\n"
-                . "Total: Rs " . number_format((float) ($order['total_amount'] ?? 0), 2) . "\n"
-                . "Thank you for your order! - " . $store['name'];
+            // ── Path 2: PHP mail() — multipart/alternative (text + HTML) ────
+            $fromName = preg_replace('/[\r\n]/', '', $store['name'] ?: 'Rooto');
+            $text     = buildOrderInvoiceText($order, $items, $store);
+            $boundary = 'b_' . bin2hex(random_bytes(12));
 
-            $mail = new PHPMailer\PHPMailer\PHPMailer(true);
-            $mail->isSMTP();
-            $mail->Host       = $smtpHost;
-            $mail->SMTPAuth   = true;
-            $mail->Username   = $smtpUser;
-            $mail->Password   = $smtpPass;
-            $mail->SMTPSecure = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
-            $mail->Port       = 587;
-            $mail->CharSet    = 'UTF-8';
-
-            $mail->setFrom($mailFrom, $store['name']);
-            $mail->addAddress($toEmail, $toName !== '' ? $toName : $toEmail);
-            if (!empty($store['email'])) {
-                $mail->addReplyTo($store['email'], $store['name'] . ' Support');
+            $headerLines = [
+                "From: {$fromName} <{$mailFrom}>",
+                "Reply-To: {$mailFrom}",
+                "MIME-Version: 1.0",
+                "Content-Type: multipart/alternative; boundary=\"{$boundary}\"",
+                "X-Mailer: PHP",
+            ];
+            if (!empty($bcc)) {
+                $headerLines[] = "Bcc: " . implode(', ', $bcc);
             }
+            $headers = implode("\r\n", $headerLines);
 
-            $mail->isHTML(true);
-            $mail->Subject = 'Your ' . $store['name'] . ' order ' . ($order['order_number'] ?? '');
-            $mail->Body    = $html;
-            $mail->AltBody = $text;
+            $bodyMime =
+                "--{$boundary}\r\n"
+                . "Content-Type: text/plain; charset=UTF-8\r\n"
+                . "Content-Transfer-Encoding: 8bit\r\n\r\n"
+                . $text . "\r\n\r\n"
+                . "--{$boundary}\r\n"
+                . "Content-Type: text/html; charset=UTF-8\r\n"
+                . "Content-Transfer-Encoding: 8bit\r\n\r\n"
+                . $html . "\r\n\r\n"
+                . "--{$boundary}--\r\n";
 
-            $mail->send();
-            error_log('[invoice_email] sent to ' . $toEmail . ' for ' . ($order['order_number'] ?? ''));
-            return true;
+            // The 5th arg (-f) sets the envelope sender so it MATCHES the From
+            // header. Without it hsendmail uses u<id>@srvXXXX.main-hosting.eu and
+            // Gmail fails SPF alignment => the message is silently dropped.
+            // (The raw mail() test that reached the inbox used exactly this.)
+            $sent = @mail($toEmail, $subject, $bodyMime, $headers, "-f{$mailFrom}");
+            error_log("[invoice_email] mail() from=$mailFrom to=$toEmail order=$orderNo => "
+                . ($sent ? 'ACCEPTED (check inbox + spam)' : 'REJECTED by MTA')
+                . ($havePhpMailer ? '' : ' [PHPMailer not on path]')
+                . ($smtpHost === '' ? ' [no SMTP]' : ''));
+            return (bool) $sent;
 
         } catch (\Throwable $e) {
             error_log('[invoice_email] FAILED: ' . $e->getMessage());

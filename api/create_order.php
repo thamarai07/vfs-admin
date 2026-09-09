@@ -236,6 +236,11 @@ try {
 
         if ($cust && !empty($cust['email'])) {
             require_once __DIR__ . '/../includes/invoice_email.php';
+
+            // Optional admin copy — set ADMIN_EMAIL in .env to your real inbox.
+            $adminEmail = $_ENV['ADMIN_EMAIL'] ?? getenv('ADMIN_EMAIL') ?: '';
+            $bcc = ($adminEmail !== '' && filter_var($adminEmail, FILTER_VALIDATE_EMAIL)) ? [$adminEmail] : [];
+
             $invoiceEmailed = sendOrderInvoiceEmail(
                 $cust['email'],
                 $cust['name'] ?? $customerName,
@@ -252,8 +257,22 @@ try {
                     'payment_method'   => $paymentMethod,
                     'notes'            => $notes,
                 ],
-                $invoiceItems
+                $invoiceItems,
+                $bcc
             );
+
+            // Record the send so the admin CMS can show it (nullable column;
+            // silently skipped if the migration hasn't run yet).
+            if ($invoiceEmailed) {
+                try {
+                    $conn->prepare("UPDATE orders SET invoice_emailed_at = NOW() WHERE id = ?")
+                         ->execute([$orderId]);
+                } catch (\Throwable $e) {
+                    error_log("[create_order] invoice_emailed_at update skipped: " . $e->getMessage());
+                }
+            }
+        } else {
+            error_log("[create_order] no customer email for customer_id={$customerId} — invoice email skipped");
         }
     } catch (\Throwable $e) {
         error_log("[create_order] invoice email skipped: " . $e->getMessage());
