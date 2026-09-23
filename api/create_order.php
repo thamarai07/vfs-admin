@@ -18,9 +18,12 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 require_once('../config/db.php');
 require_once('../config/jwt.php');
 
-// Authenticate — customerId comes from token, NOT from client body
-$authUser   = requireAuth();
-$customerId = (int) $authUser['user_id'];
+// Authenticate — customerId comes from token, NOT from client body.
+// Auth is optional: a valid Bearer token maps to a logged-in customer_id;
+// no/invalid token means a guest order (customer_id stays NULL).
+$authUser   = optionalAuth();
+$customerId = $authUser ? (int) $authUser['user_id'] : null;
+$isGuest    = $customerId === null;
 
 try {
     // Get JSON input
@@ -140,6 +143,21 @@ try {
         ? $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, unit, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)")
         : $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?)");
 
+    // Can we read the buyer's chosen unit off the still-active cart rows?
+    // (cart.php writes it there; the client payload is only a hint.)
+    $cartUnitStmt = null;
+    if ($hasItemUnit) {
+        try {
+            $cartUnitStmt = $conn->prepare(
+                "SELECT unit FROM cart
+                 WHERE session_id = ? AND product_id = ? AND status = 'active'
+                 ORDER BY id DESC LIMIT 1"
+            );
+        } catch (Throwable $e) {
+            $cartUnitStmt = null;
+        }
+    }
+
     // Collect product IDs from order items
     $orderedProductIds = [];
     $invoiceItems = []; // for the confirmation email
@@ -150,7 +168,27 @@ try {
         $quantity = floatval($item['quantity']);
         $price = floatval($item['price']);
         $itemSubtotal = floatval($item['subtotal']);
-        $unit = (isset($item['unit']) && strtolower(trim((string)$item['unit'])) === 'piece') ? 'piece' : null;
+
+        // Unit ordered: an explicit value from the client wins; if the client
+        // said nothing, fall back to what cart.php actually stored on the active
+        // cart row. An explicit 'kg' stays kg (NULL) — no fallback.
+        $sentUnit = isset($item['unit']) ? strtolower(trim((string) $item['unit'])) : '';
+        if ($sentUnit === 'piece') {
+            $unit = 'piece';
+        } elseif ($sentUnit === '' && $cartUnitStmt) {
+            $unit = null;
+            try {
+                $cartUnitStmt->execute(['user_' . $customerId, $productId]);
+                $cu = $cartUnitStmt->fetchColumn();
+                if ($cu !== false && strtolower(trim((string) $cu)) === 'piece') {
+                    $unit = 'piece';
+                }
+            } catch (Throwable $e) {
+                $unit = null;
+            }
+        } else {
+            $unit = null;
+        }
 
         $itemStmt->execute($hasItemUnit
             ? [$orderId, $productId, $productName, $unit, $quantity, $price, $itemSubtotal]
@@ -230,9 +268,18 @@ try {
     // ── Email the customer a neat invoice (best-effort, never blocks the order) ──
     $invoiceEmailed = false;
     try {
-        $custStmt = $conn->prepare("SELECT email, name FROM customers WHERE id = ?");
-        $custStmt->execute([$customerId]);
-        $cust = $custStmt->fetch(PDO::FETCH_ASSOC);
+        if ($isGuest) {
+            // Guest order — no customers row to look up; use the email they
+            // typed in the delivery address form, if any.
+            $guestEmail = trim((string) ($address['email'] ?? ''));
+            $cust = ($guestEmail !== '' && filter_var($guestEmail, FILTER_VALIDATE_EMAIL))
+                ? ['email' => $guestEmail, 'name' => $customerName]
+                : null;
+        } else {
+            $custStmt = $conn->prepare("SELECT email, name FROM customers WHERE id = ?");
+            $custStmt->execute([$customerId]);
+            $cust = $custStmt->fetch(PDO::FETCH_ASSOC);
+        }
 
         if ($cust && !empty($cust['email'])) {
             require_once __DIR__ . '/../includes/invoice_email.php';

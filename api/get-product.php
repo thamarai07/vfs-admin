@@ -104,6 +104,16 @@ try {
 
     $baseUrl = env('IMAGE_BASE_URL', 'http://localhost/vfs_portal/vfs-admin/assets/images/uploads/');
 
+    // Feature-detect the additive KG/Piece column. Absent (migration not run) =>
+    // the SELECT + response below behave exactly as before.
+    $HAS_PIECE_PRICE = false;
+    try {
+        $HAS_PIECE_PRICE = (bool) $conn->query("SHOW COLUMNS FROM products LIKE 'piece_price'")->fetch();
+    } catch (Throwable $e) {
+        $HAS_PIECE_PRICE = false;
+    }
+    $pieceCol = $HAS_PIECE_PRICE ? 'p.piece_price,' : '';
+
     // ── Build WHERE clause ────────────────────────────────────────────────────
     $where  = ["p.is_active = 1"];
     $params = [];
@@ -142,6 +152,7 @@ try {
             p.id, p.name, p.slug, p.category,
             p.price, p.price_per_kg, p.discount_percent,
             p.unit, p.min_quantity, p.max_quantity,
+            $pieceCol
             p.image, p.description, p.stock,
             p.is_featured, p.is_active,
             p.created_at, p.updated_at
@@ -179,6 +190,11 @@ try {
         $p['id']               = (int)$p['id'];
         $p['price']            = (float)$p['price'];
         $p['price_per_kg']     = (float)$p['price_per_kg'];
+        // Per-piece price when the product also sells by piece; null otherwise
+        // (and always null when the piece_price column doesn't exist yet).
+        $p['piece_price']      = isset($p['piece_price']) && $p['piece_price'] !== null && $p['piece_price'] !== ''
+            ? (float)$p['piece_price']
+            : null;
         $p['discount_percent'] = (float)($p['discount_percent'] ?? 0);
         $p['min_quantity']     = (float)($p['min_quantity']     ?? 0.25);
         $p['max_quantity']     = (float)($p['max_quantity']     ?? 100);

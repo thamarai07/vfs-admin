@@ -52,9 +52,19 @@ try {
     //   CREATE INDEX idx_slug       ON products (slug);
     //   CREATE INDEX idx_active     ON products (is_active);
     //   CREATE INDEX idx_cat_active ON products (category, is_active, stock);
+    // Feature-detect the additive KG/Piece column — absent => behaves as before.
+    $HAS_PIECE_PRICE = false;
+    try {
+        $HAS_PIECE_PRICE = (bool) $conn->query("SHOW COLUMNS FROM products LIKE 'piece_price'")->fetch();
+    } catch (Throwable $e) {
+        $HAS_PIECE_PRICE = false;
+    }
+    $pieceCol = $HAS_PIECE_PRICE ? 'piece_price,' : '';
+
     $productSql = "
         SELECT
             id, name, slug, category, price_per_kg, discount_percent, unit,
+            $pieceCol
             min_quantity, max_quantity, stock, image, description,
             meta_title, meta_description, tags, is_featured, is_active,
             created_at, updated_at
@@ -93,6 +103,9 @@ try {
 
     // ─── Cast types ───────────────────────────────────────────────────────────
     $row['price_per_kg']    = (float)$row['price_per_kg'];
+    $row['piece_price']     = isset($row['piece_price']) && $row['piece_price'] !== null && $row['piece_price'] !== ''
+        ? (float)$row['piece_price']
+        : null;
     $row['discount_percent']= (float)$row['discount_percent'];
     $row['min_quantity']    = (float)$row['min_quantity'];
     $row['max_quantity']    = (float)$row['max_quantity'];

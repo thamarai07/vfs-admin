@@ -322,6 +322,51 @@ $emailText = "Hi {$user['name']},\r\n\r\n"
     . "rooto.in";
 
 // ── 10. Send email ────────────────────────────────────────────
+// Path 0: Resend API (HTTPS) — same fix that resolved order-invoice emails
+// (GoDaddy/Titan SMTP auth was failing server-side; Resend sidesteps it
+// entirely). Tried first; falls through to SMTP/mail() below on any failure,
+// so this is purely additive — no RESEND_API_KEY set = zero behaviour change.
+$resendKey = ($_ENV['RESEND_API_KEY'] ?? getenv('RESEND_API_KEY')) ?: '';
+error_log("[ForgotPassword] RESEND_API_KEY: " . ($resendKey !== '' ? 'SET' : 'NOT SET'));
+
+if ($resendKey !== '' && function_exists('curl_init')) {
+    $mailFromResend = ($_ENV['MAIL_FROM'] ?? getenv('MAIL_FROM')) ?: 'no-reply@rooto.in';
+    $payload = [
+        'from'    => 'Rooto <' . $mailFromResend . '>',
+        'to'      => [$email],
+        'subject' => '🔑 Reset your Rooto password',
+        'html'    => $emailHtml,
+    ];
+
+    $ch = curl_init('https://api.resend.com/emails');
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $resendKey,
+            'Content-Type: application/json',
+        ],
+        CURLOPT_POSTFIELDS     => json_encode($payload),
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $resendResp = curl_exec($ch);
+    $resendCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $resendErr  = curl_error($ch);
+    curl_close($ch);
+
+    if ($resendCode >= 200 && $resendCode < 300) {
+        error_log("[ForgotPassword] ✅ Email sent via Resend API");
+        echo json_encode([
+            'status'  => 'success',
+            'message' => 'If this email is registered, a reset link has been sent.',
+        ]);
+        $conn = null;
+        exit;
+    }
+    error_log("[ForgotPassword] Resend API FAILED ($resendCode): " . ($resendErr ?: $resendResp));
+    // fall through to SMTP / mail() below
+}
+
 $autoloadPath   = __DIR__ . '/../vendor/autoload.php';
 $manualMailPath = __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
 

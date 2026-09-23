@@ -186,6 +186,7 @@ $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
 
                             <div>
                                 <p class="text-sm text-gray-500 mb-1">Invoice Email</p>
+                                <div id="invoiceEmailStatus">
                                 <?php if (!empty($order['invoice_emailed_at'])): ?>
                                     <span class="px-3 py-1 rounded-full text-sm font-semibold bg-green-100 text-green-800">
                                         <i class="fas fa-paper-plane mr-1"></i>Sent
@@ -195,6 +196,17 @@ $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
                                     <span class="px-3 py-1 rounded-full text-sm font-semibold bg-gray-100 text-gray-600">Not sent</span>
                                 <?php else: ?>
                                     <span class="text-xs text-gray-400">tracking not enabled</span>
+                                <?php endif; ?>
+                                </div>
+                                <?php if (!empty($order['customer_id'])): ?>
+                                    <button
+                                        id="resendInvoiceBtn"
+                                        onclick="resendInvoiceEmail(<?= (int)$id ?>)"
+                                        class="no-print mt-2 text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline"
+                                    >
+                                        <i class="fas fa-paper-plane mr-1"></i><span id="resendInvoiceBtnLabel"><?= !empty($order['invoice_emailed_at']) ? 'Resend email' : 'Send email now' ?></span>
+                                    </button>
+                                    <p id="invoiceEmailMsg" class="text-xs mt-1"></p>
                                 <?php endif; ?>
                             </div>
                         </div>
@@ -241,5 +253,45 @@ $items = $itemsStmt->fetchAll(PDO::FETCH_ASSOC);
             .no-print { display: none !important; }
         }
     </style>
+
+    <script>
+        // Manually (re)send the order-confirmation invoice email — see resend_invoice.php.
+        function resendInvoiceEmail(orderId) {
+            const btn = document.getElementById('resendInvoiceBtn');
+            const label = document.getElementById('resendInvoiceBtnLabel');
+            const msg = document.getElementById('invoiceEmailMsg');
+
+            btn.disabled = true;
+            const originalLabel = label.textContent;
+            label.textContent = 'Sending…';
+            msg.textContent = '';
+            msg.className = 'text-xs mt-1';
+
+            const body = new URLSearchParams({ order_id: orderId });
+
+            fetch('resend_invoice.php', { method: 'POST', body })
+                .then((r) => r.json())
+                .then((data) => {
+                    if (data.status === 'success') {
+                        msg.textContent = data.message || 'Sent!';
+                        msg.className = 'text-xs mt-1 text-green-600 font-medium';
+                        label.textContent = 'Resend email';
+                        // Reload so the "Sent" badge + timestamp reflect the new send.
+                        setTimeout(() => window.location.reload(), 1200);
+                    } else {
+                        msg.textContent = data.message || 'Failed to send';
+                        msg.className = 'text-xs mt-1 text-red-600 font-medium';
+                        label.textContent = originalLabel;
+                        btn.disabled = false;
+                    }
+                })
+                .catch(() => {
+                    msg.textContent = 'Network error — please try again';
+                    msg.className = 'text-xs mt-1 text-red-600 font-medium';
+                    label.textContent = originalLabel;
+                    btn.disabled = false;
+                });
+        }
+    </script>
 </body>
 </html>

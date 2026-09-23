@@ -106,3 +106,19 @@ function requireAuth(): array {
 
     return $payload;
 }
+
+/**
+ * Like requireAuth(), but never exits — for endpoints that support both
+ * logged-in and guest requests. Returns the decoded payload if a valid
+ * Bearer token is present, or null (no error) if the request is anonymous
+ * or the token is invalid/expired.
+ */
+function optionalAuth(): ?array {
+    $token = getBearerToken();
+    if (!$token) {
+        return null;
+    }
+
+    $payload = verifyJWT($token);
+    return $payload ?: null;
+}

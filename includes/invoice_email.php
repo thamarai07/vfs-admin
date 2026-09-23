@@ -224,11 +224,18 @@ if (!function_exists('sendOrderInvoiceEmail')) {
      *   1. PHPMailer over SMTP   (if vendor/ present AND SMTP_* env set)
      *   2. PHP mail()            (fallback — what actually works on the current host)
      */
-    function sendOrderInvoiceEmail(string $toEmail, string $toName, array $order, array $items, array $bcc = []): bool
+    // $debug: optional — pass an array by reference (e.g. $d = []; sendOrderInvoiceEmail(...,$d))
+    // to get back exactly which path/config was used and, on failure, the real
+    // exception / SMTP transcript. Used by debug_order_email.php. Passing null
+    // (the default, every existing call site) costs nothing extra.
+    function sendOrderInvoiceEmail(string $toEmail, string $toName, array $order, array $items, array $bcc = [], ?array &$debug = null): bool
     {
+        if ($debug === null) { $debug = []; }
         try {
             $toEmail = trim($toEmail);
+            $debug['to'] = $toEmail;
             if ($toEmail === '' || !filter_var($toEmail, FILTER_VALIDATE_EMAIL)) {
+                $debug['error'] = 'invalid recipient email: "' . $toEmail . '"';
                 error_log('[invoice_email] invalid recipient: ' . $toEmail);
                 return false;
             }
@@ -240,6 +247,9 @@ if (!function_exists('sendOrderInvoiceEmail')) {
             $subject = 'Your ' . $store['name'] . ' order ' . ($order['order_number'] ?? '');
             $html    = buildOrderInvoiceHtml($order, $items, $store);
             $orderNo = $order['order_number'] ?? '';
+            $debug['subject']    = $subject;
+            $debug['bcc']        = $bcc;
+            $debug['html_bytes'] = strlen($html);
 
             $smtpHost = $_ENV['SMTP_HOST'] ?? getenv('SMTP_HOST') ?: '';
             $smtpUser = $_ENV['SMTP_USER'] ?? getenv('SMTP_USER') ?: '';
@@ -253,28 +263,112 @@ if (!function_exists('sendOrderInvoiceEmail')) {
             if ($siteDomain === '' || strpos($siteDomain, '.') === false) $siteDomain = 'rooto.in';
             $mailFrom   = ($_ENV['MAIL_FROM'] ?? getenv('MAIL_FROM')) ?: ('no-reply@' . $siteDomain);
 
+            // ── Path 0: Resend API (HTTPS, no SMTP port needed) ──────────────
+            // Preferred when configured — sidesteps shared-hosting SMTP port
+            // blocks and Gmail's mail()-from-shared-IP spam filtering entirely.
+            // Falls through to SMTP/mail() below on any failure, so this is
+            // purely additive — no RESEND_API_KEY set = zero behaviour change.
+            $resendKey = ($_ENV['RESEND_API_KEY'] ?? getenv('RESEND_API_KEY')) ?: '';
+            $debug['resend_configured'] = ($resendKey !== '');
+            if ($resendKey !== '' && function_exists('curl_init')) {
+                $debug['path'] = 'resend';
+                $payload = [
+                    'from'    => $store['name'] . ' <' . $mailFrom . '>',
+                    'to'      => [$toEmail],
+                    'subject' => $subject,
+                    'html'    => $html,
+                ];
+                if (!empty($bcc)) { $payload['bcc'] = $bcc; }
+                if (!empty($store['email'])) { $payload['reply_to'] = $store['email']; }
+
+                $ch = curl_init('https://api.resend.com/emails');
+                curl_setopt_array($ch, [
+                    CURLOPT_RETURNTRANSFER => true,
+                    CURLOPT_POST           => true,
+                    CURLOPT_HTTPHEADER     => [
+                        'Authorization: Bearer ' . $resendKey,
+                        'Content-Type: application/json',
+                    ],
+                    CURLOPT_POSTFIELDS     => json_encode($payload),
+                    CURLOPT_TIMEOUT        => 15,
+                ]);
+                $resp     = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr  = curl_error($ch);
+                curl_close($ch);
+
+                $debug['resend_http_code'] = $httpCode;
+                $debug['resend_response']  = $resp;
+
+                if ($httpCode >= 200 && $httpCode < 300) {
+                    $debug['result'] = 'sent-via-resend';
+                    error_log("[invoice_email] sent via Resend API to $toEmail for $orderNo");
+                    return true;
+                }
+                $debug['error'] = 'Resend API failed: HTTP ' . $httpCode . ' ' . ($curlErr ?: $resp);
+                error_log("[invoice_email] Resend API FAILED ($httpCode) for $orderNo: " . ($curlErr ?: $resp));
+                // fall through to SMTP / mail() below
+            }
+
             $autoload = __DIR__ . '/../vendor/autoload.php';
-            $manual   = __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
-            $havePhpMailer = file_exists($autoload) || file_exists($manual);
+            // The intended layout is vendor/PHPMailer/src/…; the copy that was
+            // actually uploaded landed one level deeper at
+            // vendor/vendor/PHPMailer/src/… — check both so a manual re-upload
+            // isn't needed.
+            $manualCandidates = [
+                __DIR__ . '/../vendor/PHPMailer/src',
+                __DIR__ . '/../vendor/vendor/PHPMailer/src',
+            ];
+            $manualSrcDir = null;
+            foreach ($manualCandidates as $dir) {
+                if (file_exists($dir . '/PHPMailer.php')) {
+                    $manualSrcDir = $dir;
+                    break;
+                }
+            }
+            $havePhpMailer = file_exists($autoload) || $manualSrcDir !== null;
+            $debug['have_phpmailer'] = $havePhpMailer;
+            $debug['smtp_configured'] = ($smtpHost !== '' && $smtpUser !== '' && $smtpPass !== '');
+            $debug['mail_from'] = $mailFrom;
 
             // ── Path 1: PHPMailer + SMTP ────────────────────────────────────
             if ($havePhpMailer && $smtpHost !== '' && $smtpUser !== '' && $smtpPass !== '') {
+                $debug['path'] = 'smtp';
                 if (file_exists($autoload)) {
                     require_once $autoload;
                 } else {
-                    require_once __DIR__ . '/../vendor/PHPMailer/src/Exception.php';
-                    require_once __DIR__ . '/../vendor/PHPMailer/src/PHPMailer.php';
-                    require_once __DIR__ . '/../vendor/PHPMailer/src/SMTP.php';
+                    require_once $manualSrcDir . '/Exception.php';
+                    require_once $manualSrcDir . '/PHPMailer.php';
+                    require_once $manualSrcDir . '/SMTP.php';
                 }
 
+                // Port/encryption are configurable (mailbox providers differ —
+                // e.g. Hostinger/Titan often want 465+SSL instead of 587+STARTTLS)
+                // but default to the common STARTTLS:587 combo.
+                $smtpPort   = (int) (($_ENV['SMTP_PORT'] ?? getenv('SMTP_PORT')) ?: 587);
+                $smtpSecure = strtolower((string) (($_ENV['SMTP_SECURE'] ?? getenv('SMTP_SECURE')) ?: 'tls'));
+                $debug['smtp_host']   = $smtpHost;
+                $debug['smtp_user']   = $smtpUser;
+                $debug['smtp_port']   = $smtpPort;
+                $debug['smtp_secure'] = $smtpSecure;
+
                 $mail = new PHPMailer\PHPMailer\PHPMailer(true);
+                // Only turn on the (noisy) SMTP transcript when a caller asked
+                // for debug info — never in normal order-placement sends.
+                $debugRef =& $debug;
+                $mail->SMTPDebug   = PHPMailer\PHPMailer\SMTP::DEBUG_SERVER;
+                $mail->Debugoutput = function ($str, $level) use (&$debugRef) {
+                    $debugRef['smtp_log'][] = trim(preg_replace('/\s+/', ' ', $str));
+                };
                 $mail->isSMTP();
                 $mail->Host       = $smtpHost;
                 $mail->SMTPAuth   = true;
                 $mail->Username   = $smtpUser;
                 $mail->Password   = $smtpPass;
-                $mail->SMTPSecure = PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
-                $mail->Port       = 587;
+                $mail->SMTPSecure = $smtpSecure === 'ssl'
+                    ? PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_SMTPS
+                    : PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+                $mail->Port       = $smtpPort;
                 $mail->CharSet    = 'UTF-8';
                 $mail->setFrom($mailFrom, $store['name']);
                 $mail->addAddress($toEmail, $toName !== '' ? $toName : $toEmail);
@@ -288,44 +382,50 @@ if (!function_exists('sendOrderInvoiceEmail')) {
                 $mail->AltBody = "Order $orderNo — total Rs "
                     . number_format((float) ($order['total_amount'] ?? 0), 2)
                     . ". Thank you for your order! - " . $store['name'];
-                $mail->send();
+                try {
+                    $mail->send();
+                } catch (\Throwable $e) {
+                    $debug['error'] = $e->getMessage();
+                    $debug['phpmailer_error_info'] = $mail->ErrorInfo;
+                    error_log("[invoice_email] SMTP send FAILED to $toEmail for $orderNo: {$mail->ErrorInfo}");
+                    return false;
+                }
+                $debug['result'] = 'sent';
                 error_log("[invoice_email] sent via SMTP to $toEmail for $orderNo");
                 return true;
             }
+            $debug['path'] = 'mail()';
 
-            // ── Path 2: PHP mail() — multipart/alternative (text + HTML) ────
+            // ── Path 2: PHP mail() — single-part HTML ────────────────────────
+            // Was multipart/alternative (text+HTML in one MIME message) — that
+            // version was silently dropped by Gmail even though mail() reported
+            // success, while a plain single-part text/html mail() with the same
+            // sender DID arrive (confirmed 2026-09-11 via invoice_email_test.php's
+            // raw-mail probe). So this now mirrors that exact working shape:
+            // same minimal header set, single Content-Type, no boundary/MIME
+            // multipart, no X-Mailer. Trade-off: no plain-text alternative part —
+            // acceptable, virtually every mail client renders HTML today.
             $fromName = preg_replace('/[\r\n]/', '', $store['name'] ?: 'Rooto');
-            $text     = buildOrderInvoiceText($order, $items, $store);
-            $boundary = 'b_' . bin2hex(random_bytes(12));
 
             $headerLines = [
                 "From: {$fromName} <{$mailFrom}>",
                 "Reply-To: {$mailFrom}",
                 "MIME-Version: 1.0",
-                "Content-Type: multipart/alternative; boundary=\"{$boundary}\"",
-                "X-Mailer: PHP",
+                "Content-Type: text/html; charset=UTF-8",
             ];
             if (!empty($bcc)) {
                 $headerLines[] = "Bcc: " . implode(', ', $bcc);
             }
             $headers = implode("\r\n", $headerLines);
 
-            $bodyMime =
-                "--{$boundary}\r\n"
-                . "Content-Type: text/plain; charset=UTF-8\r\n"
-                . "Content-Transfer-Encoding: 8bit\r\n\r\n"
-                . $text . "\r\n\r\n"
-                . "--{$boundary}\r\n"
-                . "Content-Type: text/html; charset=UTF-8\r\n"
-                . "Content-Transfer-Encoding: 8bit\r\n\r\n"
-                . $html . "\r\n\r\n"
-                . "--{$boundary}--\r\n";
-
             // The 5th arg (-f) sets the envelope sender so it MATCHES the From
             // header. Without it hsendmail uses u<id>@srvXXXX.main-hosting.eu and
             // Gmail fails SPF alignment => the message is silently dropped.
             // (The raw mail() test that reached the inbox used exactly this.)
-            $sent = @mail($toEmail, $subject, $bodyMime, $headers, "-f{$mailFrom}");
+            error_clear_last();
+            $sent = @mail($toEmail, $subject, $html, $headers, "-f{$mailFrom}");
+            $debug['result']    = $sent ? 'accepted-by-mta' : 'rejected-by-mta';
+            $debug['php_error'] = error_get_last()['message'] ?? null;
             error_log("[invoice_email] mail() from=$mailFrom to=$toEmail order=$orderNo => "
                 . ($sent ? 'ACCEPTED (check inbox + spam)' : 'REJECTED by MTA')
                 . ($havePhpMailer ? '' : ' [PHPMailer not on path]')
@@ -333,6 +433,7 @@ if (!function_exists('sendOrderInvoiceEmail')) {
             return (bool) $sent;
 
         } catch (\Throwable $e) {
+            $debug['error'] = $e->getMessage();
             error_log('[invoice_email] FAILED: ' . $e->getMessage());
             return false;
         }

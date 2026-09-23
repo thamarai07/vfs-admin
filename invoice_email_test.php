@@ -26,11 +26,15 @@ $line('PHP version', PHP_VERSION);
 $line('APP_ENV', $_ENV['APP_ENV'] ?? getenv('APP_ENV') ?: '(not set)');
 
 // ── 1. PHPMailer present? ────────────────────────────────────────────────
+// Same lookup as includes/invoice_email.php — checks the intended
+// vendor/PHPMailer/src/ location AND the vendor/vendor/PHPMailer/src/ spot the
+// zip actually extracted to, so this diagnostic matches reality.
 $autoload = __DIR__ . '/vendor/autoload.php';
 $manual   = __DIR__ . '/vendor/PHPMailer/src/PHPMailer.php';
-$havePhpMailer = file_exists($autoload) || file_exists($manual);
+$manualFallback = __DIR__ . '/vendor/vendor/PHPMailer/src/PHPMailer.php';
+$havePhpMailer = file_exists($autoload) || file_exists($manual) || file_exists($manualFallback);
 $line('vendor/autoload.php', file_exists($autoload) ? 'FOUND' : 'missing');
-$line('vendor/PHPMailer/src/', file_exists($manual) ? 'FOUND' : 'missing');
+$line('vendor/PHPMailer/src/', file_exists($manual) ? 'FOUND' : (file_exists($manualFallback) ? 'FOUND (at vendor/vendor/PHPMailer/src/)' : 'missing'));
 if (!$havePhpMailer) {
     $line('=> PHPMailer', 'not installed — will use PHP mail() fallback (same as Forgot Password)');
 }
