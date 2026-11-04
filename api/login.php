@@ -1,19 +1,9 @@
 <?php
 require_once __DIR__ . '/../config/cors.php';
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/rate_limit.php';
 header('Content-Type: application/json');
-
-function base64UrlEncode(string $data): string {
-    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
-}
-
-function generateJWT(array $payload, string $secret): string {
-    $header  = json_encode(['typ' => 'JWT', 'alg' => 'HS256']);
-    $b64Head = base64UrlEncode($header);
-    $b64Pay  = base64UrlEncode(json_encode($payload));
-    $sig     = hash_hmac('sha256', "$b64Head.$b64Pay", $secret, true);
-    return "$b64Head.$b64Pay." . base64UrlEncode($sig);
-}
 
 $data = json_decode(file_get_contents('php://input'), true);
 
@@ -26,6 +16,16 @@ $login      = trim($data['login']);
 $password   = $data['password'];
 $rememberMe = !empty($data['remember_me']); // NEW
 
+// Brute-force protection: 5 wrong passwords per account+IP, and 30 per IP, in 15 minutes.
+$rlAccount = 'customer:' . clientIp() . ':' . strtolower($login);
+$rlIp      = 'customer-ip:' . clientIp();
+$wait = max(rateLimitBlocked($rlAccount), rateLimitBlocked($rlIp, 30));
+if ($wait > 0) {
+    http_response_code(429);
+    echo json_encode(['status' => 'error', 'message' => 'Too many attempts. Please try again in ' . (int) ceil($wait / 60) . ' minute(s).']);
+    exit;
+}
+
 $query = filter_var($login, FILTER_VALIDATE_EMAIL)
     ? "SELECT id, name, email, phone, password_hash FROM customers WHERE email = :login"
     : "SELECT id, name, email, phone, password_hash FROM customers WHERE phone = :login";
@@ -34,14 +34,23 @@ try {
     $stmt = $conn->prepare($query);
     $stmt->bindParam(':login', $login);
     $stmt->execute();
-    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    // Older data has a few duplicate phone numbers, so check every match.
+    $user = null;
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $candidate) {
+        if (password_verify($password, $candidate['password_hash'])) {
+            $user = $candidate;
+            break;
+        }
+    }
 
-    if (!$user || !password_verify($password, $user['password_hash'])) {
+    if (!$user) {
+        rateLimitFail($rlAccount);
+        rateLimitFail($rlIp);
         echo json_encode(['status' => 'error', 'message' => 'Invalid email/mobile or password']);
         exit;
     }
 
-    $jwtSecret = $_ENV['JWT_SECRET'] ?? 'change-this-secret-in-env';
+    rateLimitReset($rlAccount);
     $payload   = [
         'user_id' => $user['id'],
         'email'   => $user['email'],
@@ -49,7 +58,7 @@ try {
         'iat'     => time(),
         'exp'     => time() + (7 * 24 * 60 * 60),
     ];
-    $jwt = generateJWT($payload, $jwtSecret);
+    $jwt = jwtSign($payload);
 
     $response = [
         'status' => 'success',
@@ -88,7 +97,7 @@ try {
 
     echo json_encode($response);
 
-} catch (PDOException $e) {
+} catch (Throwable $e) {
     error_log("Login API DB Error: " . $e->getMessage());
     echo json_encode(['status' => 'error', 'message' => 'An error occurred. Please try again.']);
 }

@@ -1,19 +1,26 @@
 <?php
+/**
+ * Customer order history (website "My Orders" + mobile app).
+ * GET /api/get_orderssite.php   (Bearer token required)
+ * The customer is taken from the verified JWT. Any customer_id in the query
+ * string is ignored, so one customer can never read another's orders.
+ */
+require_once __DIR__ . '/../config/cors.php';   // CORS (allows Authorization) + OPTIONS preflight
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 
-require_once('../config/db.php');
+$authUser = requireAuth();
+
 
 // Get customer_id from query params
-$customer_id = isset($_GET['customer_id']) ? intval($_GET['customer_id']) : null;
+$customer_id = (int) $authUser['user_id'];
 $status = isset($_GET['status']) ? $_GET['status'] : 'all';
 $search = isset($_GET['search']) ? trim($_GET['search']) : '';
 $dateFrom = isset($_GET['from']) ? trim($_GET['from']) : '';   // YYYY-MM-DD
 $dateTo   = isset($_GET['to'])   ? trim($_GET['to'])   : '';   // YYYY-MM-DD
-$page = isset($_GET['page']) ? intval($_GET['page']) : 1;
-$limit = isset($_GET['limit']) ? intval($_GET['limit']) : 20;
+$page = max(1, (int) ($_GET['page'] ?? 1));
+$limit = min(100, max(1, (int) ($_GET['limit'] ?? 20)));
 $offset = ($page - 1) * $limit;
 $datesOnly = isset($_GET['dates']) && $_GET['dates'] == '1'; // calendar: list order dates
 
@@ -173,8 +180,10 @@ try {
     ]);
 
 } catch (PDOException $e) {
+    error_log('get_orderssite.php Error: ' . $e->getMessage());
+    http_response_code(500);
     echo json_encode([
         'status' => 'error',
-        'message' => 'Database error: ' . $e->getMessage()
+        'message' => 'Could not load your orders. Please try again.'
     ]);
 }

@@ -4,13 +4,26 @@
  * Fixed: removed raw die() error, fixed $order['total'] -> $order['total_amount'], store info from .env
  */
 
+// CORS first: the website fetches this with an Authorization header, so the
+// browser sends an OPTIONS preflight that must be answered (cors.php does it).
+require_once __DIR__ . '/../config/cors.php';
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 require_once __DIR__ . '/../includes/invoice_email.php'; // invoiceFormatQty() helper
 
 $order_id    = isset($_GET['order_id'])    ? (int) $_GET['order_id']    : null;
-$customer_id = isset($_GET['customer_id']) ? (int) $_GET['customer_id'] : null;
+// Owner comes from the verified JWT (Authorization header), never the URL's customer_id.
+$authUser    = optionalAuth();
+$customer_id = $authUser ? (int) $authUser['user_id'] : null;
 
-if (!$order_id || !$customer_id) {
+if (!$customer_id) {
+    header('Content-Type: application/json');
+    http_response_code(401);
+    echo json_encode(['success' => false, 'message' => 'Please log in to download this invoice']);
+    exit;
+}
+
+if (!$order_id) {
     header('Content-Type: application/json');
     http_response_code(400);
     echo json_encode(['success' => false, 'message' => 'Invalid request']);

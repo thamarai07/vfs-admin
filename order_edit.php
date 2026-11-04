@@ -11,6 +11,7 @@ if (!isset($_SESSION['admin_id'])) {
 }
 
 require_once('config/db.php');
+require_once('config/order_stock.php');
 
 $order_id = isset($_GET['id']) ? intval($_GET['id']) : 0;
 $message = '';
@@ -23,9 +24,15 @@ if ($order_id === 0) {
 
 // Handle form submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
-    $new_status = $_POST['status'];
-    $new_payment_status = $_POST['payment_status'];
-    $delivery_date = $_POST['delivery_date'];
+    $new_status = $_POST['status'] ?? '';
+    $new_payment_status = $_POST['payment_status'] ?? '';
+    $delivery_date = ($_POST['delivery_date'] ?? '') !== '' ? $_POST['delivery_date'] : null;
+    if (!in_array($new_status, ['pending', 'confirmed', 'processing', 'delivered', 'cancelled'], true)) {
+        $new_status = null;
+    }
+    if (!in_array($new_payment_status, ['unpaid', 'paid', 'partial'], true)) {
+        $new_payment_status = null;
+    }
     $notes = $_POST['notes'];
     $admin_notes = $_POST['admin_notes'];
     
@@ -35,6 +42,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
     $current_stmt->bindValue(':order_id', $order_id, PDO::PARAM_INT);
     $current_stmt->execute();
     $current = $current_stmt->fetch(PDO::FETCH_ASSOC);
+    // An invalid value from the form keeps what the order already has.
+    $new_status         = $new_status ?? $current['status'];
+    $new_payment_status = $new_payment_status ?? $current['payment_status'];
     
     // Start transaction
     $conn->beginTransaction();
@@ -59,6 +69,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_order'])) {
         $update_stmt->bindValue(':order_id', $order_id, PDO::PARAM_INT);
         $update_stmt->execute();
         
+        // Cancelling gives back the stock this order took (once).
+        if ($new_status === 'cancelled' && $current['status'] !== 'cancelled') {
+            restoreOrderStock($conn, $order_id);
+        }
+
         // Log status change if status changed
         if ($current['status'] !== $new_status) {
             $history_query = "
@@ -246,6 +261,7 @@ include('includes/header.php');
                                     <option value="confirmed" <?= $order['status'] === 'confirmed' ? 'selected' : '' ?>>Confirmed</option>
                                     <option value="processing" <?= $order['status'] === 'processing' ? 'selected' : '' ?>>Processing</option>
                                     <option value="delivered" <?= $order['status'] === 'delivered' ? 'selected' : '' ?>>Delivered</option>
+                                    <option value="cancelled" <?= $order['status'] === 'cancelled' ? 'selected' : '' ?>>Cancelled</option>
                                 </select>
                             </div>
                             <div class="col-md-6">

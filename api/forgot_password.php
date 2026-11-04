@@ -38,7 +38,7 @@ try {
     error_log("[ForgotPassword] DB loaded OK");
 } catch (Throwable $e) {
     error_log("[ForgotPassword] DB load FAILED: " . $e->getMessage());
-    echo json_encode(['status' => 'error', 'message' => 'DB config error', 'debug' => $e->getMessage()]);
+    echo json_encode(['status' => 'error', 'message' => 'DB config error']);
     exit;
 }
 
@@ -46,23 +46,34 @@ try {
 $raw  = file_get_contents('php://input');
 $data = json_decode($raw, true);
 
-error_log("[ForgotPassword] Raw input: " . $raw);
 
 if (empty($data['email'])) {
-    echo json_encode(['status' => 'error', 'message' => 'Email is required', 'debug' => 'missing_email']);
+    echo json_encode(['status' => 'error', 'message' => 'Email is required']);
     exit;
 }
 
 $email = trim($data['email']);
 
 if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
-    echo json_encode(['status' => 'error', 'message' => 'Invalid email', 'debug' => 'invalid_email_format']);
+    echo json_encode(['status' => 'error', 'message' => 'Invalid email']);
     exit;
 }
 
+// Stop reset-email spam: 3 requests per email and 10 per IP every 15 minutes.
+require_once __DIR__ . '/../config/rate_limit.php';
+$rlEmail = 'reset:' . strtolower($email);
+$rlIp    = 'reset-ip:' . clientIp();
+if (rateLimitBlocked($rlEmail, 3) || rateLimitBlocked($rlIp, 10)) {
+    http_response_code(429);
+    echo json_encode(['status' => 'error', 'message' => 'Too many reset requests. Please try again in 15 minutes.']);
+    exit;
+}
+rateLimitFail($rlEmail);
+rateLimitFail($rlIp);
+
 // ── 4. Check DB connection ────────────────────────────────────
 if (!isset($conn)) {
-    echo json_encode(['status' => 'error', 'message' => 'DB connection failed', 'debug' => 'conn_not_set']);
+    echo json_encode(['status' => 'error', 'message' => 'DB connection failed']);
     exit;
 }
 
@@ -71,15 +82,12 @@ try {
     $tableCheck  = $conn->query("SHOW TABLES LIKE 'password_resets'")->fetchAll();
     $tableExists = count($tableCheck) > 0;
     if (!$tableExists) {
-        echo json_encode([
-            'status' => 'error',
-            'debug'  => 'table_password_resets_missing',
-            'fix'    => 'Run the CREATE TABLE SQL from the setup guide',
-        ]);
+        error_log('[ForgotPassword] password_resets table is missing');
+        echo json_encode(['status' => 'error', 'message' => 'Something went wrong. Please try again.']);
         exit;
     }
 } catch (PDOException $e) {
-    echo json_encode(['status' => 'error', 'debug' => 'table_check_failed', 'error' => $e->getMessage()]);
+    echo json_encode(['status' => 'error', 'message' => 'Something went wrong. Please try again.']);
     exit;
 }
 
@@ -89,9 +97,8 @@ try {
     $stmt->bindParam(':email', $email);
     $stmt->execute();
     $user = $stmt->fetch(PDO::FETCH_ASSOC);
-    error_log("[ForgotPassword] User found: " . ($user ? "YES id=" . $user['id'] : "NO"));
-} catch (PDOException $e) {
-    echo json_encode(['status' => 'error', 'debug' => 'user_lookup_failed', 'error' => $e->getMessage()]);
+    } catch (PDOException $e) {
+    echo json_encode(['status' => 'error', 'message' => 'Something went wrong. Please try again.']);
     exit;
 }
 
@@ -112,7 +119,7 @@ try {
     $ins->execute([':customer_id' => $user['id'], ':token' => $token, ':expires_at' => $expiresAt]);
     error_log("[ForgotPassword] Token saved");
 } catch (PDOException $e) {
-    echo json_encode(['status' => 'error', 'debug' => 'token_save_failed', 'error' => $e->getMessage()]);
+    echo json_encode(['status' => 'error', 'message' => 'Something went wrong. Please try again.']);
     exit;
 }
 
@@ -123,7 +130,6 @@ $userName    = htmlspecialchars($user['name'], ENT_QUOTES, 'UTF-8');
 $userEmail   = htmlspecialchars($email, ENT_QUOTES, 'UTF-8');
 $currentYear = date('Y');
 
-error_log("[ForgotPassword] Reset URL: " . $resetUrl);
 
 // ── 9. Build Email HTML ───────────────────────────────────────
 $emailHtml = <<<HTML
@@ -397,11 +403,7 @@ if (file_exists($autoloadPath) || file_exists($manualMailPath)) {
     if (empty($smtpHost) || empty($smtpUser) || empty($smtpPass)) {
         echo json_encode([
             'status'    => 'error',
-            'message'   => 'Email config missing in .env',
-            'debug'     => 'missing_smtp_config',
-            'fix'       => 'Add SMTP_HOST, SMTP_USER, SMTP_PASS to your .env file',
-            'token'     => $token,    // ← REMOVE IN PRODUCTION
-            'reset_url' => $resetUrl, // ← REMOVE IN PRODUCTION
+            'message'   => 'We could not send the email right now. Please try again later.',
         ]);
         exit;
     }
@@ -437,10 +439,6 @@ if (file_exists($autoloadPath) || file_exists($manualMailPath)) {
         echo json_encode([
             'status'    => 'error',
             'message'   => 'Failed to send email.',
-            'debug'     => 'phpmailer_send_failed',
-            'error'     => $mail->ErrorInfo,
-            'token'     => $token,    // ← REMOVE IN PRODUCTION
-            'reset_url' => $resetUrl, // ← REMOVE IN PRODUCTION
         ]);
         exit;
     }
@@ -465,9 +463,6 @@ if (file_exists($autoloadPath) || file_exists($manualMailPath)) {
         echo json_encode([
             'status'    => 'error',
             'message'   => 'Could not send email.',
-            'debug'     => 'no_phpmailer_and_mail_failed',
-            'token'     => $token,    // ← REMOVE IN PRODUCTION
-            'reset_url' => $resetUrl, // ← REMOVE IN PRODUCTION
         ]);
         exit;
     }

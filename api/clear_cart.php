@@ -1,13 +1,20 @@
 <?php
-header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type');
+/**
+ * Clear Cart API
+ * POST /api/clear_cart.php   (Bearer token required)
+ * Body: { "orderId": 123 }   (optional — links the cleared rows to that order)
+ *
+ * Marks the logged-in customer's active cart rows as 'ordered'.
+ * - The customer comes from the verified JWT; a customerId in the body is ignored.
+ * - The old hard-coded 'user_1' fallback is gone (it emptied customer #1's cart).
+ * - create_order.php already does this inside its transaction, so this is
+ *   only a safety net for older clients.
+ */
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
-    exit();
-}
+require_once __DIR__ . '/../config/cors.php';
+header('Content-Type: application/json');
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
@@ -15,107 +22,37 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit();
 }
 
-require_once('../config/db.php');
+$authUser   = requireAuth();
+$customerId = (int) $authUser['user_id'];
 
 try {
-    $input = file_get_contents('php://input');
-    $data = json_decode($input, true);
-    
-    $customerId = isset($data['customerId']) ? intval($data['customerId']) : null;
-    $orderId = isset($data['orderId']) ? intval($data['orderId']) : null;
-    
-    if (!$customerId) {
-        throw new Exception('Customer ID is required');
-    }
-    
-    // 🔥 TRY BOTH: Real session AND hardcoded user_1
-    $sessionIds = [
-        'user_' . $customerId,  // Try actual user session (user_8)
-        'user_1'                // Try hardcoded session (user_1)
-    ];
-    
-    error_log("🔍 Trying sessions: " . implode(', ', $sessionIds));
-    
-    $conn->beginTransaction();
-    
-    $totalMarked = 0;
-    $usedSessionId = null;
-    
-    // Try each session ID
-    foreach ($sessionIds as $sessionId) {
-        // Check if items exist for this session
-        $checkStmt = $conn->prepare("
-            SELECT COUNT(*) as count 
-            FROM cart 
-            WHERE session_id = ? 
-            AND status = 'active'
-        ");
-        $checkStmt->execute([$sessionId]);
-        $count = $checkStmt->fetch(PDO::FETCH_ASSOC)['count'];
-        
-        error_log("📊 Found $count active items for session: $sessionId");
-        
-        if ($count > 0) {
-            // Found items! Update them
-            $updateStmt = $conn->prepare("
-                UPDATE cart 
-                SET 
-                    status = 'ordered',
-                    order_id = ?,
-                    updated_at = NOW()
-                WHERE session_id = ? 
-                AND status = 'active'
-            ");
-            
-            $updateStmt->execute([$orderId, $sessionId]);
-            $markedCount = $updateStmt->rowCount();
-            
-            $totalMarked += $markedCount;
-            $usedSessionId = $sessionId;
-            
-            error_log("✅ Marked $markedCount items as 'ordered' for session: $sessionId");
-            
-            break; // Stop after finding items
+    $data    = json_decode(file_get_contents('php://input'), true) ?: [];
+    $orderId = isset($data['orderId']) ? (int) $data['orderId'] : null;
+
+    // Only link to an order that really belongs to this customer.
+    if ($orderId) {
+        $own = $conn->prepare("SELECT id FROM orders WHERE id = ? AND customer_id = ?");
+        $own->execute([$orderId, $customerId]);
+        if (!$own->fetch()) {
+            $orderId = null;
         }
     }
-    
-    $conn->commit();
-    
-    if ($totalMarked > 0) {
-        echo json_encode([
-            'success' => true,
-            'message' => "Successfully marked $totalMarked items as ordered",
-            'data' => [
-                'markedItems' => $totalMarked,
-                'sessionId' => $usedSessionId,
-                'orderId' => $orderId,
-                'customerId' => $customerId,
-                'note' => $usedSessionId === 'user_1' ? 'Using legacy session (user_1)' : 'Using actual user session'
-            ]
-        ]);
-    } else {
-        echo json_encode([
-            'success' => true,
-            'message' => 'No active cart items found',
-            'data' => [
-                'markedItems' => 0,
-                'triedSessions' => $sessionIds,
-                'note' => 'Cart was already empty or items already processed'
-            ]
-        ]);
-    }
-    
-} catch (Exception $e) {
-    if (isset($conn) && $conn->inTransaction()) {
-        $conn->rollBack();
-    }
-    
-    error_log("❌ ERROR: " . $e->getMessage());
-    
-    http_response_code(400);
+
+    $stmt = $conn->prepare("
+        UPDATE cart
+        SET status = 'ordered', order_id = ?, updated_at = NOW()
+        WHERE session_id = ? AND status = 'active'
+    ");
+    $stmt->execute([$orderId, 'user_' . $customerId]);
+    $marked = $stmt->rowCount();
+
     echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
+        'success' => true,
+        'message' => $marked > 0 ? "Successfully marked $marked items as ordered" : 'No active cart items found',
+        'data'    => ['markedItems' => $marked, 'orderId' => $orderId],
     ]);
+} catch (Exception $e) {
+    error_log('clear_cart.php Error: ' . $e->getMessage());
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => 'Could not clear the cart. Please try again.']);
 }
-?>

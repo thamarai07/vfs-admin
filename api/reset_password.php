@@ -46,6 +46,9 @@ try {
     $mark = $conn->prepare("UPDATE password_resets SET used = 1 WHERE id = :id");
     $mark->execute([':id' => $reset['id']]);
 
+    // Log out other devices: old "remember me" tokens stop working after a reset.
+    $conn->prepare("DELETE FROM remember_me_tokens WHERE customer_id = ?")->execute([$reset['customer_id']]);
+
     echo json_encode(['status' => 'success', 'message' => 'Password reset successfully']);
 
 } catch (PDOException $e) {

@@ -1,4 +1,7 @@
 <?php
+// Banner CRUD for the admin panel only (the storefront reads banners from fetchbanner.php).
+require_once __DIR__ . "/../config/admin_auth.php";
+requireAdmin(true);
 header("Content-Type: application/json");
 
 require_once "../config/bannerconfig.php";

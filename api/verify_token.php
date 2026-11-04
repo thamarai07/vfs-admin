@@ -1,69 +1,36 @@
 <?php
+/**
+ * Verify a login token.
+ * GET|POST /api/verify_token.php   (Authorization: Bearer <jwt>)
+ *
+ * Uses the shared verifier in config/jwt.php, which reads JWT_SECRET from .env.
+ * (This file used to carry its own hard-coded secret, which is in git history —
+ * it no longer matches the live secret and is not used anywhere now.)
+ */
+require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: POST, GET');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
+require_once __DIR__ . '/../config/jwt.php';
 
-function base64UrlDecode($data) {
-    return base64_decode(strtr($data, '-_', '+/'));
-}
-
-function verifyJWT($jwt, $secret) {
-    $parts = explode('.', $jwt);
-    
-    if (count($parts) !== 3) {
-        return ["valid" => false, "message" => "Invalid token format"];
-    }
-    
-    [$header, $payload, $signature] = $parts;
-    
-    // Verify signature
-    $validSignature = hash_hmac('sha256', $header . "." . $payload, $secret, true);
-    $validSignatureEncoded = rtrim(strtr(base64_encode($validSignature), '+/', '-_'), '=');
-    
-    if ($signature !== $validSignatureEncoded) {
-        return ["valid" => false, "message" => "Invalid signature"];
-    }
-    
-    // Decode payload
-    $payloadData = json_decode(base64UrlDecode($payload), true);
-    
-    // Check expiration
-    if (isset($payloadData['exp']) && $payloadData['exp'] < time()) {
-        return ["valid" => false, "message" => "Token expired"];
-    }
-    
-    return ["valid" => true, "payload" => $payloadData];
-}
-
-// Get token from Authorization header
-$headers = getallheaders();
-$token = null;
-
-if (isset($headers['Authorization'])) {
-    $authHeader = $headers['Authorization'];
-    if (preg_match('/Bearer\s+(.*)$/i', $authHeader, $matches)) {
-        $token = $matches[1];
-    }
-}
-
+$token = getBearerToken();
 if (!$token) {
-    echo json_encode(["status" => "error", "message" => "No token provided"]);
+    http_response_code(401);
+    echo json_encode(['status' => 'error', 'message' => 'No token provided']);
     exit();
 }
 
-$jwtSecret = "yyyyfSDSWFRWF34rGRS43##$3453gt";
-$result = verifyJWT($token, $jwtSecret);
-
-if ($result["valid"]) {
-    echo json_encode([
-        "status" => "success",
-        "user" => $result["payload"]
-    ]);
-} else {
-    echo json_encode([
-        "status" => "error",
-        "message" => $result["message"]
-    ]);
+$payload = verifyJWT($token);
+if (!$payload) {
+    http_response_code(401);
+    echo json_encode(['status' => 'error', 'message' => 'Invalid or expired token']);
+    exit();
 }
-?>
+
+echo json_encode([
+    'status' => 'success',
+    'user'   => [
+        'user_id' => $payload['user_id'] ?? null,
+        'email'   => $payload['email'] ?? null,
+        'name'    => $payload['name'] ?? null,
+        'exp'     => $payload['exp'] ?? null,
+    ],
+]);

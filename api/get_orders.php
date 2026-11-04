@@ -8,6 +8,7 @@ require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
 
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
     http_response_code(405);
@@ -16,11 +17,9 @@ if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
 }
 
 try {
-    if (!isset($_GET['customer_id'])) {
-        throw new Exception('Customer ID is required');
-    }
-
-    $customerId = (int) $_GET['customer_id'];
+    // Customer comes from the verified JWT — a customer_id in the URL is ignored.
+    $authUser   = requireAuth();
+    $customerId = (int) $authUser['user_id'];
     $page       = max((int) ($_GET['page']  ?? 1), 1);
     $limit      = min(max((int) ($_GET['limit'] ?? 10), 1), 100);
     $offset     = ($page - 1) * $limit;

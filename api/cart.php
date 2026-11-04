@@ -164,16 +164,19 @@ try {
                     exit;
                 }
 
+                // Match on the owner + product, never on cart.id alone: the cart table
+                // had no primary key, so every row had id = 0 and "WHERE id = ?"
+                // rewrote every customer's cart.
                 if ($HAS_CART_UNIT) {
                     $conn->prepare("
                         UPDATE cart SET quantity = ?, unit = ?, last_added_at = ?, updated_at = NOW()
-                        WHERE id = ?
-                    ")->execute([$newQty, $unit, $last_added, $existing['id']]);
+                        WHERE session_id = ? AND product_id = ? AND status = 'active'
+                    ")->execute([$newQty, $unit, $last_added, $session_id, $product_id]);
                 } else {
                     $conn->prepare("
                         UPDATE cart SET quantity = ?, last_added_at = ?, updated_at = NOW()
-                        WHERE id = ?
-                    ")->execute([$newQty, $last_added, $existing['id']]);
+                        WHERE session_id = ? AND product_id = ? AND status = 'active'
+                    ")->execute([$newQty, $last_added, $session_id, $product_id]);
                 }
 
                 echo json_encode([

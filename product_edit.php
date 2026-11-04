@@ -57,11 +57,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         
         if (in_array($ext, $allowed)) {
             $imageName = 'product_' . time() . '_' . rand(1000,9999) . '.' . $ext;
-            $uploadPath = '../assets/images/uploads/' . $imageName;
+            $uploadPath = 'assets/images/uploads/' . $imageName;
             
             if (move_uploaded_file($_FILES['image']['tmp_name'], $uploadPath)) {
-                if ($product['image'] && file_exists('../assets/images/uploads/' . $product['image'])) {
-                    @unlink('../assets/images/uploads/' . $product['image']);
+                if ($product['image'] && file_exists('assets/images/uploads/' . $product['image'])) {
+                    @unlink('assets/images/uploads/' . $product['image']);
                 }
             } else {
                 $error = "Failed to upload image.";
@@ -270,7 +270,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             <h3 class="text-xl font-bold text-gray-800 mb-4">Product Image</h3>
                             <?php if ($product['image']): ?>
                             <div class="mb-6">
-                                <img src="../assets/images/uploads/<?= htmlspecialchars($product['image']) ?>" alt="Current" class="w-64 h-64 object-cover rounded-xl mx-auto shadow-lg">
+                                <img src="assets/images/uploads/<?= htmlspecialchars($product['image']) ?>" alt="Current" class="w-64 h-64 object-cover rounded-xl mx-auto shadow-lg">
                                 <p class="text-sm text-gray-600 mt-3">Current Image</p>
                             </div>
                             <?php endif; ?>

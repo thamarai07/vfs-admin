@@ -1,3 +1,7 @@
+<?php
+require_once __DIR__ . "/config/admin_auth.php";
+requireAdmin();
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>

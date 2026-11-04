@@ -1,6 +1,13 @@
 <?php
+// Session cookie: not readable by JavaScript, HTTPS-only when served over HTTPS.
+session_set_cookie_params([
+    'httponly' => true,
+    'secure'   => ($_SERVER['HTTPS'] ?? '') === 'on' || ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https',
+    'samesite' => 'Lax',
+]);
 session_start();
 require_once "config/db.php";
+require_once "config/rate_limit.php";
 
 // If already logged in, redirect to dashboard
 if (isset($_SESSION['admin_id'])) {
@@ -14,7 +21,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $username = trim($_POST['username'] ?? '');
     $password = $_POST['password'] ?? '';
     
-    if (empty($username) || empty($password)) {
+    // Brute-force protection: 5 wrong passwords per username+IP, 20 per IP, per 15 minutes.
+    $rlUser = 'admin:' . clientIp() . ':' . strtolower($username);
+    $rlIp   = 'admin-ip:' . clientIp();
+    $wait   = max(rateLimitBlocked($rlUser), rateLimitBlocked($rlIp, 20));
+
+    if ($wait > 0) {
+        $error = "Too many failed attempts. Please try again in " . (int) ceil($wait / 60) . " minute(s).";
+    } elseif (empty($username) || empty($password)) {
         $error = "Please enter both username and password";
     } else {
         try {
@@ -23,7 +37,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $user = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if ($user && password_verify($password, $user['password_hash'])) {
-                // Login successful
+                // Login successful — new session id so a planted id can't be reused.
+                session_regenerate_id(true);
+                rateLimitReset($rlUser);
                 $_SESSION['admin_id'] = $user['id'];
                 $_SESSION['admin_username'] = $user['username'];
                 $_SESSION['admin_name'] = $user['full_name'];
@@ -36,6 +52,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 header("Location: dashboard.php");
                 exit;
             } else {
+                rateLimitFail($rlUser);
+                rateLimitFail($rlIp);
                 $error = "Invalid username or password";
             }
         } catch (Exception $e) {

@@ -99,6 +99,18 @@ if (strlen($password) < 6) {
     exit();
 }
 
+// The customers table has no UNIQUE index yet, so check explicitly.
+try {
+    $dup = $conn->prepare("SELECT 1 FROM customers WHERE LOWER(email) = LOWER(?) OR phone = ? LIMIT 1");
+    $dup->execute([$email, $phone]);
+    if ($dup->fetch()) {
+        echo json_encode(['status' => 'error', 'message' => 'An account with this email or mobile number already exists. Please log in.']);
+        exit();
+    }
+} catch (PDOException $e) {
+    error_log('Register duplicate check failed: ' . $e->getMessage());
+}
+
 $password_hash = password_hash($password, PASSWORD_BCRYPT);
 
 try {

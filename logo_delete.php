@@ -1,6 +1,8 @@
 <?php
+require_once __DIR__ . "/config/admin_auth.php";
+requireAdmin();
 require_once "config/db.php";
-$id = $_GET['id'];
+$id = (int) ($_GET['id'] ?? 0);
 $stmt = $conn->prepare("DELETE FROM logo_master WHERE id = ?");
 $stmt->execute([$id]);
 header("Location: logo_master.php");

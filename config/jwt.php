@@ -56,6 +56,23 @@ function verifyJWT(string $token): array|false {
 }
 
 /**
+ * Sign a payload as an HS256 JWT with JWT_SECRET.
+ * Throws if JWT_SECRET is missing — never falls back to a guessable default
+ * (a known fallback secret would let anyone forge a login token).
+ */
+function jwtSign(array $payload): string {
+    $secret = env('JWT_SECRET', '');
+    if (empty($secret)) {
+        error_log('[jwt.php] JWT_SECRET is not set — refusing to issue tokens');
+        throw new RuntimeException('Login is temporarily unavailable');
+    }
+    $enc  = fn(string $d) => rtrim(strtr(base64_encode($d), '+/', '-_'), '=');
+    $head = $enc(json_encode(['typ' => 'JWT', 'alg' => 'HS256']));
+    $body = $enc(json_encode($payload));
+    return "$head.$body." . $enc(hash_hmac('sha256', "$head.$body", $secret, true));
+}
+
+/**
  * Extract the Bearer token from the Authorization header.
  */
 function getBearerToken(): ?string {
@@ -76,9 +93,7 @@ function getBearerToken(): ?string {
         return trim($m[1]);
     }
 
-    if (isset($_GET['token'])) {
-        return $_GET['token'];
-    }
+    // No ?token= fallback: tokens in URLs end up in server logs and browser history.
 
     return null;
 }

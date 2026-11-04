@@ -1,19 +1,8 @@
 <?php
 require_once __DIR__ . '/../config/cors.php';
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
 header('Content-Type: application/json');
-
-function base64UrlEncode(string $data): string {
-    return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
-}
-
-function generateJWT(array $payload, string $secret): string {
-    $header  = json_encode(['typ' => 'JWT', 'alg' => 'HS256']);
-    $b64Head = base64UrlEncode($header);
-    $b64Pay  = base64UrlEncode(json_encode($payload));
-    $sig     = hash_hmac('sha256', "$b64Head.$b64Pay", $secret, true);
-    return "$b64Head.$b64Pay." . base64UrlEncode($sig);
-}
 
 $data  = json_decode(file_get_contents('php://input'), true);
 $token = trim($data['remember_me_token'] ?? '');
@@ -57,14 +46,13 @@ try {
     ]);
 
     // Issue a fresh JWT
-    $jwtSecret = $_ENV['JWT_SECRET'] ?? 'change-this-secret-in-env';
-    $jwt       = generateJWT([
+    $jwt       = jwtSign([
         'user_id' => $row['id'],
         'email'   => $row['email'],
         'name'    => $row['name'],
         'iat'     => time(),
         'exp'     => time() + (7 * 24 * 60 * 60),
-    ], $jwtSecret);
+    ]);
 
     echo json_encode([
         'status'             => 'success',
@@ -78,7 +66,7 @@ try {
         ],
     ]);
 
-} catch (PDOException $e) {
+} catch (Throwable $e) {
     error_log("AutoLogin DB Error: " . $e->getMessage());
     echo json_encode(['status' => 'error', 'message' => 'An error occurred']);
 }

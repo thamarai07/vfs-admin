@@ -1,16 +1,27 @@
 <?php
-session_start();
+require_once __DIR__ . "/config/admin_auth.php";
+requireAdmin();
 require_once "config/db.php";
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $logo_name = $_POST['logo_name'];
+    $logo_name = trim($_POST['logo_name'] ?? '');
     $target_dir = "assets/uploads/logo/";
-    if (!file_exists($target_dir)) mkdir($target_dir, 0777, true);
+    if (!file_exists($target_dir)) mkdir($target_dir, 0755, true);
 
-    $file_name = time() . "_" . basename($_FILES["logo"]["name"]);
+    // Only real images. The uploaded name is never used on disk (it allowed .php uploads).
+    $allowedTypes = [IMAGETYPE_PNG => 'png', IMAGETYPE_JPEG => 'jpg', IMAGETYPE_GIF => 'gif', IMAGETYPE_WEBP => 'webp'];
+    $tmp  = $_FILES['logo']['tmp_name'] ?? '';
+    $info = ($tmp && is_uploaded_file($tmp) && ($_FILES['logo']['error'] ?? 1) === UPLOAD_ERR_OK) ? @getimagesize($tmp) : false;
+    $ext  = $info ? ($allowedTypes[$info[2]] ?? null) : null;
+    if (!$ext || ($_FILES['logo']['size'] ?? 0) > 5 * 1024 * 1024) {
+        echo "<script>alert('Please upload a PNG, JPG, GIF or WEBP image under 5 MB');window.location.href='logo_master.php';</script>";
+        exit;
+    }
+
+    $file_name = 'logo_' . time() . '_' . bin2hex(random_bytes(4)) . '.' . $ext;
     $target_file = $target_dir . $file_name;
 
-    if (move_uploaded_file($_FILES["logo"]["tmp_name"], $target_file)) {
+    if (move_uploaded_file($tmp, $target_file)) {
         $conn->query("UPDATE logo_master SET is_active = 0");
         $stmt = $conn->prepare("INSERT INTO logo_master (logo_name, logo_path, is_active) VALUES (?, ?, 1)");
         $stmt->execute([$logo_name, $target_file]);

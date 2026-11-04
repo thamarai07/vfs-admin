@@ -4,16 +4,13 @@
  * File: api/update_order_status.php
  */
 
-session_start();
+// login.php sets $_SESSION['admin_id'] (the old 'admin_logged_in' check always failed).
+require_once __DIR__ . '/../config/admin_auth.php';
+requireAdmin(true);
 header('Content-Type: application/json');
 
-if (!isset($_SESSION['admin_logged_in']) || $_SESSION['admin_logged_in'] !== true) {
-    http_response_code(401);
-    echo json_encode(['success' => false, 'message' => 'Unauthorized']);
-    exit();
-}
-
-require_once('../config/db.php');
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/order_stock.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     http_response_code(405);
@@ -41,7 +38,8 @@ try {
     }
     
     // Validate values
-    $valid_status = ['pending', 'confirmed', 'processing', 'delivered'];
+    // Must match the orders.status ENUM ('shipped' does not exist there).
+    $valid_status = ['pending', 'confirmed', 'processing', 'delivered', 'cancelled'];
     $valid_payment = ['unpaid', 'paid', 'partial'];
     
     if ($field === 'status' && !in_array($value, $valid_status)) {
@@ -74,6 +72,10 @@ try {
     $update_stmt->bindValue(':value', $value);
     $update_stmt->bindValue(':order_id', $order_id, PDO::PARAM_INT);
     $update_stmt->execute();
+
+    if ($field === 'status' && $value === 'cancelled' && $old_value !== 'cancelled') {
+        restoreOrderStock($conn, $order_id);
+    }
     
     // Log status change if status field
     if ($field === 'status') {
@@ -106,7 +108,7 @@ try {
     ]);
     
 } catch (Exception $e) {
-    if (isset($conn)) {
+    if (isset($conn) && $conn->inTransaction()) {
         $conn->rollBack();
     }
     

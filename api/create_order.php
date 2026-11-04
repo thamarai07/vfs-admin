@@ -2,6 +2,19 @@
 /**
  * Create Order API (COD) - WITH WISHLIST STATUS UPDATE
  * File: create_order.php
+ *
+ * SECURITY: every price is taken from the products table, never from the
+ * client. The client only says WHICH products, HOW MUCH and in WHICH unit.
+ * Name / price / subtotal fields sent by older clients are ignored.
+ *
+ * Pricing rules (identical to cart.php so the cart and the order agree):
+ *   kg line    -> products.price_per_kg  x quantity
+ *   piece line -> products.piece_price   x quantity (whole pieces only)
+ *   tax 8%, delivery ₹50 unless the subtotal is above ₹500.
+ *
+ * Stock: kg lines are checked and reduced inside the same transaction
+ * (rows locked with FOR UPDATE, so two buyers can't take the last kilo).
+ * Piece lines are not taken from the kg stock.
  */
 
 require_once __DIR__ . '/../config/cors.php';  // Handles CORS + OPTIONS preflight
@@ -14,9 +27,13 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     exit();
 }
 
-// Database connection
-require_once('../config/db.php');
-require_once('../config/jwt.php');
+require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+
+const TAX_RATE              = 0.08;
+const FREE_SHIPPING_ABOVE   = 500;
+const SHIPPING_FEE          = 50;
+const MAX_LINE_QUANTITY     = 100;
 
 // Authenticate — customerId comes from token, NOT from client body.
 // Auth is optional: a valid Bearer token maps to a logged-in customer_id;
@@ -25,70 +42,44 @@ $authUser   = optionalAuth();
 $customerId = $authUser ? (int) $authUser['user_id'] : null;
 $isGuest    = $customerId === null;
 
+/** Error the customer should see (safe to show). */
+class OrderError extends Exception {}
+
 try {
-    // Get JSON input
-    $input = file_get_contents('php://input');
-    $data = json_decode($input, true);
+    $data = json_decode(file_get_contents('php://input'), true);
 
-    // Validate required fields (customerId now comes from JWT — not required in body)
-    if (!isset($data['items']) || !isset($data['address']) || !isset($data['total'])) {
-        throw new Exception('Missing required fields');
+    if (!is_array($data) || !isset($data['items'], $data['address'], $data['total'])) {
+        throw new OrderError('Missing required fields');
     }
-
-    // Validate items array
     if (!is_array($data['items']) || empty($data['items'])) {
-        throw new Exception('Cart is empty or invalid');
+        throw new OrderError('Cart is empty or invalid');
+    }
+    if (count($data['items']) > 100) {
+        throw new OrderError('Too many items in one order');
     }
 
-    // Extract data (customerId already set from JWT above)
-    $items         = $data['items'];
-    $address       = $data['address'];
-    $notes         = isset($data['notes']) ? trim($data['notes']) : '';
-    $paymentMethod = isset($data['paymentMethod']) ? $data['paymentMethod'] : 'cod';
+    $items   = $data['items'];
+    $address = is_array($data['address']) ? $data['address'] : [];
+    $notes   = mb_substr(trim((string) ($data['notes'] ?? '')), 0, 1000);
 
-    // Calculate totals
-    $subtotal = 0;
-    foreach ($items as $item) {
-        $subtotal += floatval($item['subtotal']);
+    // orders.payment_method is ENUM('cash','online','upi'). 'cod' used to be
+    // written as-is, which MySQL stored as '' — so map it.
+    $pmRaw         = strtolower(trim((string) ($data['paymentMethod'] ?? 'cod')));
+    $paymentMethod = in_array($pmRaw, ['online', 'upi'], true) ? $pmRaw : 'cash';
+
+    // ── Delivery details ─────────────────────────────────────────────
+    $customerName  = mb_substr(trim((string) ($address['name'] ?? '')), 0, 100);
+    $customerPhone = substr(preg_replace('/\D/', '', (string) ($address['phoneNumber'] ?? $address['phone'] ?? '')), -10);
+    if ($customerName === '') {
+        throw new OrderError('Please add the receiver’s name to the delivery address');
     }
-
-    // Recalculate totals (match frontend calculation)
-    $tax = $subtotal * 0.08; // 8% tax
-    $shippingCharge = $subtotal > 500 ? 0 : 50;
-    $totalAmount = $subtotal + $tax + $shippingCharge;
-
-    // More flexible validation (allow 1 rupee difference for rounding)
-    $receivedTotal = floatval($data['total']);
-    if (abs($totalAmount - $receivedTotal) > 1.0) {
-        error_log("Total mismatch - Calculated: $totalAmount, Received: $receivedTotal");
-        throw new Exception("Total amount mismatch. Calculated: ₹" . number_format($totalAmount, 2) . ", Received: ₹" . number_format($receivedTotal, 2));
+    if (!preg_match('/^\d{10}$/', $customerPhone)) {
+        throw new OrderError('Please add a valid 10-digit mobile number to the delivery address');
     }
-
-    // Use the frontend total to avoid rounding issues
-    $totalAmount = $receivedTotal;
-
-    // Start transaction
-    $conn->beginTransaction();
-
-    // Generate unique order number
-    $orderNumber = 'ORD' . date('Ymd') . str_pad(rand(0, 9999), 4, '0', STR_PAD_LEFT);
-
-    // Check if order number already exists (retry if duplicate)
-    $checkStmt = $conn->prepare("SELECT id FROM orders WHERE order_number = ?");
-    $checkStmt->execute([$orderNumber]);
-
-    if ($checkStmt->rowCount() > 0) {
-        // Generate new order number if duplicate
-        $orderNumber = 'ORD' . date('Ymd') . str_pad(rand(0, 9999), 4, '0', STR_PAD_LEFT);
-    }
-
-    // Extract address details
-    $customerName = $address['name'];
-    $customerPhone = $address['phoneNumber'];
 
     // Build full address string from whatever structured parts were sent.
     // Falls back gracefully to the legacy `fullAddress` line.
-    $addressKeys = ['flatNo', 'streetAddress', 'area', 'landmark', 'city', 'state', 'pincode', 'country'];
+    $addressKeys  = ['flatNo', 'streetAddress', 'area', 'landmark', 'city', 'state', 'pincode', 'country'];
     $addressParts = [];
     foreach ($addressKeys as $key) {
         if (isset($address[$key]) && trim((string) $address[$key]) !== '') {
@@ -102,167 +93,224 @@ try {
         // legacy callers only send fullAddress (+ flatNo/landmark)
         $addressParts[] = $address['fullAddress'];
     }
-    $customerAddress = implode(', ', $addressParts);
+    $customerAddress = mb_substr(implode(', ', $addressParts), 0, 2000);
+    if ($customerAddress === '') {
+        throw new OrderError('Please add a delivery address');
+    }
 
-    // Insert order into orders table
-    $stmt = $conn->prepare("
+    // ── Optional columns (feature-detected, like the rest of the API) ──
+    $hasColumn = function (string $table, string $col) use ($conn): bool {
+        try {
+            return (bool) $conn->query("SHOW COLUMNS FROM `$table` LIKE " . $conn->quote($col))->fetch();
+        } catch (Throwable $e) {
+            return false;
+        }
+    };
+    $hasItemUnit     = $hasColumn('order_items', 'unit');
+    $hasPiecePrice   = $hasColumn('products', 'piece_price');
+    $hasStockFlag    = $hasColumn('orders', 'stock_deducted');
+
+    // ── Normalise the requested lines (product, unit, quantity) ───────
+    // The unit an older client didn't send is read from the buyer's active cart row.
+    $cartUnitStmt = (!$isGuest && $hasItemUnit)
+        ? $conn->prepare("SELECT unit FROM cart WHERE session_id = ? AND product_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1")
+        : null;
+
+    $lines = [];
+    foreach ($items as $item) {
+        $productId = (int) ($item['id'] ?? $item['product_id'] ?? 0);
+        $quantity  = round((float) ($item['quantity'] ?? 0), 2);
+        if ($productId <= 0 || $quantity <= 0 || $quantity > MAX_LINE_QUANTITY) {
+            throw new OrderError('One of the items in your cart has an invalid quantity');
+        }
+
+        $sentUnit = isset($item['unit']) ? strtolower(trim((string) $item['unit'])) : '';
+        $unit     = $sentUnit === 'piece' ? 'piece' : 'kg';
+        if ($sentUnit === '' && $cartUnitStmt) {
+            $cartUnitStmt->execute(['user_' . $customerId, $productId]);
+            $cu = $cartUnitStmt->fetchColumn();
+            if ($cu !== false && strtolower(trim((string) $cu)) === 'piece') {
+                $unit = 'piece';
+            }
+        }
+        if ($unit === 'piece' && floor($quantity) != $quantity) {
+            throw new OrderError('Pieces can only be ordered in whole numbers');
+        }
+
+        $key = $productId . '|' . $unit;   // same product + unit twice -> one line
+        if (isset($lines[$key])) {
+            $lines[$key]['quantity'] = round($lines[$key]['quantity'] + $quantity, 2);
+        } else {
+            $lines[$key] = ['product_id' => $productId, 'unit' => $unit, 'quantity' => $quantity];
+        }
+    }
+
+    // ── Price everything from the database, inside a transaction ──────
+    $conn->beginTransaction();
+
+    $productIds   = array_values(array_unique(array_column($lines, 'product_id')));
+    $placeholders = implode(',', array_fill(0, count($productIds), '?'));
+    $pieceCol     = $hasPiecePrice ? 'piece_price' : 'NULL AS piece_price';
+    $pStmt = $conn->prepare("
+        SELECT id, name, price_per_kg, $pieceCol, stock, is_active, max_quantity
+        FROM products
+        WHERE id IN ($placeholders)
+        FOR UPDATE
+    ");
+    $pStmt->execute($productIds);
+    $products = [];
+    foreach ($pStmt->fetchAll(PDO::FETCH_ASSOC) as $p) {
+        $products[(int) $p['id']] = $p;
+    }
+
+    $subtotal  = 0.0;
+    $kgByProduct = [];
+    foreach ($lines as &$line) {
+        $p = $products[$line['product_id']] ?? null;
+        if (!$p || (int) $p['is_active'] !== 1) {
+            throw new OrderError('Some items in your cart are no longer available. Please review your cart.');
+        }
+
+        if ($line['unit'] === 'piece') {
+            $price = (float) ($p['piece_price'] ?? 0);
+            if ($price <= 0) {
+                throw new OrderError("{$p['name']} is not sold by the piece any more. Please review your cart.");
+            }
+        } else {
+            $price = (float) $p['price_per_kg'];
+            $kgByProduct[$line['product_id']] = ($kgByProduct[$line['product_id']] ?? 0) + $line['quantity'];
+            $max = (float) ($p['max_quantity'] ?? 0);
+            if ($max > 0 && $kgByProduct[$line['product_id']] > $max) {
+                throw new OrderError("You can order up to {$max} kg of {$p['name']}");
+            }
+        }
+        if ($price <= 0) {
+            throw new OrderError("{$p['name']} can’t be ordered right now. Please try again later.");
+        }
+
+        $line['name']     = $p['name'];
+        $line['price']    = round($price, 2);
+        $line['subtotal'] = round($price * $line['quantity'], 2);
+        $subtotal        += $line['subtotal'];
+    }
+    unset($line);
+
+    // Stock check for kg lines (rows are locked above).
+    foreach ($kgByProduct as $pid => $qty) {
+        $stock = (float) $products[$pid]['stock'];
+        if ($qty > $stock) {
+            $left = rtrim(rtrim(number_format(max(0, $stock), 2, '.', ''), '0'), '.');
+            throw new OrderError($stock > 0
+                ? "Only {$left} kg of {$products[$pid]['name']} is left. Please reduce the quantity."
+                : "{$products[$pid]['name']} is out of stock. Please remove it from your cart.");
+        }
+    }
+
+    $subtotal       = round($subtotal, 2);
+    $tax            = round($subtotal * TAX_RATE, 2);
+    $shippingCharge = $subtotal > FREE_SHIPPING_ABOVE ? 0 : SHIPPING_FEE;
+    $totalAmount    = round($subtotal + $tax + $shippingCharge, 2);
+
+    // The customer must have seen the same total (₹1 allowed for rounding).
+    // If a price changed since they loaded the cart, stop and let them review.
+    $receivedTotal = (float) $data['total'];
+    if (abs($totalAmount - $receivedTotal) > 1.0) {
+        error_log("Total mismatch - Calculated: $totalAmount, Received: $receivedTotal");
+        throw new OrderError('Prices in your cart have changed. Your new total is ₹' . number_format($totalAmount, 2) . '. Please review your cart and try again.');
+    }
+
+    // ── Unique order number ─────────────────────────────────────────
+    $checkStmt   = $conn->prepare("SELECT id FROM orders WHERE order_number = ?");
+    $orderNumber = null;
+    for ($try = 0; $try < 5; $try++) {
+        $candidate = 'ORD' . date('Ymd') . str_pad((string) random_int(0, 9999), 4, '0', STR_PAD_LEFT);
+        $checkStmt->execute([$candidate]);
+        if (!$checkStmt->fetch()) {
+            $orderNumber = $candidate;
+            break;
+        }
+    }
+    if ($orderNumber === null) {
+        $orderNumber = 'ORD' . date('YmdHis') . random_int(10, 99);
+    }
+
+    // ── Save the order ──────────────────────────────────────────────
+    $conn->prepare("
         INSERT INTO orders (
             order_number, customer_id, customer_name, customer_phone, customer_address,
             subtotal, tax, shipping_charge, total_amount, notes,
             payment_method, payment_status, status
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unpaid', 'pending')
-    ");
-
-    $stmt->execute([
-        $orderNumber,
-        $customerId,
-        $customerName,
-        $customerPhone,
-        $customerAddress,
-        $subtotal,
-        $tax,
-        $shippingCharge,
-        $totalAmount,
-        $notes,
-        $paymentMethod
+    ")->execute([
+        $orderNumber, $customerId, $customerName, $customerPhone, $customerAddress,
+        $subtotal, $tax, $shippingCharge, $totalAmount, $notes, $paymentMethod,
     ]);
-
-    $orderId = $conn->lastInsertId();
-
-    // Insert order items.
-    // `unit` is an additive nullable column — only used when the festival
-    // migration has been run; otherwise this behaves exactly as before.
-    $hasItemUnit = false;
-    try {
-        $hasItemUnit = (bool) $conn->query("SHOW COLUMNS FROM order_items LIKE 'unit'")->fetch();
-    } catch (Throwable $e) {
-        $hasItemUnit = false;
-    }
+    $orderId = (int) $conn->lastInsertId();
 
     $itemStmt = $hasItemUnit
         ? $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, unit, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?, ?)")
         : $conn->prepare("INSERT INTO order_items (order_id, product_id, product_name, quantity, price, subtotal) VALUES (?, ?, ?, ?, ?, ?)");
 
-    // Can we read the buyer's chosen unit off the still-active cart rows?
-    // (cart.php writes it there; the client payload is only a hint.)
-    $cartUnitStmt = null;
-    if ($hasItemUnit) {
-        try {
-            $cartUnitStmt = $conn->prepare(
-                "SELECT unit FROM cart
-                 WHERE session_id = ? AND product_id = ? AND status = 'active'
-                 ORDER BY id DESC LIMIT 1"
-            );
-        } catch (Throwable $e) {
-            $cartUnitStmt = null;
-        }
+    $orderedProductIds = [];
+    $invoiceItems      = []; // for the confirmation email
+    foreach ($lines as $line) {
+        $dbUnit = $line['unit'] === 'piece' ? 'piece' : null;   // NULL = kg (legacy convention)
+        $itemStmt->execute($hasItemUnit
+            ? [$orderId, $line['product_id'], $line['name'], $dbUnit, $line['quantity'], $line['price'], $line['subtotal']]
+            : [$orderId, $line['product_id'], $line['name'], $line['quantity'], $line['price'], $line['subtotal']]
+        );
+        $orderedProductIds[] = $line['product_id'];
+        $invoiceItems[] = [
+            'name'     => $line['name'],
+            'unit'     => $dbUnit,
+            'quantity' => $line['quantity'],
+            'price'    => $line['price'],
+            'subtotal' => $line['subtotal'],
+        ];
     }
 
-    // Collect product IDs from order items
-    $orderedProductIds = [];
-    $invoiceItems = []; // for the confirmation email
-
-    foreach ($items as $item) {
-        $productId = intval($item['id']);
-        $productName = $item['name'];
-        $quantity = floatval($item['quantity']);
-        $price = floatval($item['price']);
-        $itemSubtotal = floatval($item['subtotal']);
-
-        // Unit ordered: an explicit value from the client wins; if the client
-        // said nothing, fall back to what cart.php actually stored on the active
-        // cart row. An explicit 'kg' stays kg (NULL) — no fallback.
-        $sentUnit = isset($item['unit']) ? strtolower(trim((string) $item['unit'])) : '';
-        if ($sentUnit === 'piece') {
-            $unit = 'piece';
-        } elseif ($sentUnit === '' && $cartUnitStmt) {
-            $unit = null;
-            try {
-                $cartUnitStmt->execute(['user_' . $customerId, $productId]);
-                $cu = $cartUnitStmt->fetchColumn();
-                if ($cu !== false && strtolower(trim((string) $cu)) === 'piece') {
-                    $unit = 'piece';
-                }
-            } catch (Throwable $e) {
-                $unit = null;
-            }
-        } else {
-            $unit = null;
+    // Take the kg stock.
+    if ($kgByProduct) {
+        $dec = $conn->prepare("UPDATE products SET stock = stock - ? WHERE id = ?");
+        foreach ($kgByProduct as $pid => $qty) {
+            $dec->execute([$qty, $pid]);
         }
-
-        $itemStmt->execute($hasItemUnit
-            ? [$orderId, $productId, $productName, $unit, $quantity, $price, $itemSubtotal]
-            : [$orderId, $productId, $productName, $quantity, $price, $itemSubtotal]
-        );
-
-        // Track product IDs for wishlist update
-        $orderedProductIds[] = $productId;
-
-        $invoiceItems[] = [
-            'name'     => $productName,
-            'unit'     => $unit,
-            'quantity' => $quantity,
-            'price'    => $price,
-            'subtotal' => $itemSubtotal,
-        ];
+        if ($hasStockFlag) {
+            $conn->prepare("UPDATE orders SET stock_deducted = 1 WHERE id = ?")->execute([$orderId]);
+        }
     }
 
     // Insert status history (if you have this table)
     try {
-        $historyStmt = $conn->prepare("
+        $conn->prepare("
             INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, notes)
             VALUES (?, NULL, 'pending', ?, 'Order created')
-        ");
-        $historyStmt->execute([$orderId, $customerId]);
+        ")->execute([$orderId, $customerId]);
     } catch (Exception $e) {
-        // If table doesn't exist, just log and continue
         error_log("Status history insert skipped: " . $e->getMessage());
     }
 
-    // 🔥 MARK CART AS 'ORDERED'
-    $sessionId = 'user_' . $customerId;
-    $updateCartStmt = $conn->prepare("
-        UPDATE cart 
-        SET 
-            status = 'ordered',
-            order_id = ?,
-            updated_at = NOW()
-        WHERE session_id = ? 
-        AND status = 'active'
-    ");
-    $updateCartStmt->execute([$orderId, $sessionId]);
-    $markedCartItems = $updateCartStmt->rowCount();
-
-    error_log("✅ Marked $markedCartItems cart items as 'ordered' for order #$orderId");
-
-    // 🔥🔥 NEW: MARK WISHLIST ITEMS AS 'ORDERED' 🔥🔥
+    $markedCartItems     = 0;
     $markedWishlistItems = 0;
-    
-    if (!empty($orderedProductIds)) {
-        // Build placeholders for IN clause
-        $placeholders = str_repeat('?,', count($orderedProductIds) - 1) . '?';
-        
-        $updateWishlistStmt = $conn->prepare("
-            UPDATE favorites 
-            SET 
-                status = 'ordered',
-                order_id = ?
-            WHERE user_id = ? 
-            AND product_id IN ($placeholders)
-            AND status = 'active'
+    if (!$isGuest) {
+        // Mark the customer's cart as ordered.
+        $updateCartStmt = $conn->prepare("
+            UPDATE cart SET status = 'ordered', order_id = ?, updated_at = NOW()
+            WHERE session_id = ? AND status = 'active'
         ");
-        
-        // Merge parameters: orderId, userId, ...productIds
-        $params = array_merge([$orderId, $customerId], $orderedProductIds);
-        
-        $updateWishlistStmt->execute($params);
+        $updateCartStmt->execute([$orderId, 'user_' . $customerId]);
+        $markedCartItems = $updateCartStmt->rowCount();
+
+        // Mark matching wishlist items as ordered.
+        $ph = implode(',', array_fill(0, count($orderedProductIds), '?'));
+        $updateWishlistStmt = $conn->prepare("
+            UPDATE favorites SET status = 'ordered', order_id = ?
+            WHERE user_id = ? AND product_id IN ($ph) AND status = 'active'
+        ");
+        $updateWishlistStmt->execute(array_merge([$orderId, $customerId], $orderedProductIds));
         $markedWishlistItems = $updateWishlistStmt->rowCount();
-        
-        error_log("✅ Marked $markedWishlistItems wishlist items as 'ordered' for order #$orderId");
-        error_log("   Product IDs: " . implode(', ', $orderedProductIds));
     }
 
-    // Commit transaction
     $conn->commit();
 
     // ── Email the customer a neat invoice (best-effort, never blocks the order) ──
@@ -325,35 +373,37 @@ try {
         error_log("[create_order] invoice email skipped: " . $e->getMessage());
     }
 
-    // Send success response
     echo json_encode([
         'success' => true,
         'message' => 'Order placed successfully',
         'data' => [
-            'orderId' => $orderId,
-            'orderNumber' => $orderNumber,
-            'totalAmount' => $totalAmount,
-            'paymentMethod' => $paymentMethod,
-            'orderStatus' => 'pending',
-            'cartMarkedAsOrdered' => true,
-            'itemsMarked' => $markedCartItems,
-            'wishlistItemsMarked' => $markedWishlistItems, // NEW: Track wishlist updates
-            'invoiceEmailed' => $invoiceEmailed
+            'orderId'             => $orderId,
+            'orderNumber'         => $orderNumber,
+            'subtotal'            => $subtotal,
+            'tax'                 => $tax,
+            'shippingCharge'      => $shippingCharge,
+            'totalAmount'         => $totalAmount,
+            'paymentMethod'       => $paymentMethod,
+            'orderStatus'         => 'pending',
+            'cartMarkedAsOrdered' => !$isGuest,
+            'itemsMarked'         => $markedCartItems,
+            'wishlistItemsMarked' => $markedWishlistItems,
+            'invoiceEmailed'      => $invoiceEmailed,
         ]
     ]);
 
-} catch (Exception $e) {
-    // Rollback transaction on error
+} catch (OrderError $e) {
     if (isset($conn) && $conn->inTransaction()) {
         $conn->rollBack();
     }
-
-    error_log("Order creation error: " . $e->getMessage());
-
     http_response_code(400);
-    echo json_encode([
-        'success' => false,
-        'message' => $e->getMessage()
-    ]);
+    echo json_encode(['success' => false, 'message' => $e->getMessage()]);
+} catch (Throwable $e) {
+    // Database / unexpected errors: log the detail, show a safe message.
+    if (isset($conn) && $conn->inTransaction()) {
+        $conn->rollBack();
+    }
+    error_log("Order creation error: " . $e->getMessage());
+    http_response_code(500);
+    echo json_encode(['success' => false, 'message' => 'We couldn’t place your order. Please try again.']);
 }
-?>

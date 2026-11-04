@@ -1,144 +1,108 @@
 <?php
+/**
+ * Cancel Order API
+ * POST /api/cancel_order.php   (Bearer token required)
+ * Body: { "order_id": 123, "reason": "..." }
+ *
+ * - The customer comes from the verified JWT. A customer_id in the body is
+ *   ignored, so nobody can cancel another customer's order.
+ * - Stock is put back only for orders whose stock was actually taken at
+ *   checkout (orders.stock_deducted = 1, set by create_order.php). Older orders
+ *   never reduced stock, so restoring for them would inflate stock.
+ */
+
 require_once __DIR__ . '/../config/cors.php';
 header('Content-Type: application/json');
-
 require_once __DIR__ . '/../config/db.php';
+require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/order_stock.php';
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+    http_response_code(405);
     echo json_encode(['status' => 'error', 'message' => 'Invalid request method']);
     exit;
 }
 
-$data = json_decode(file_get_contents('php://input'), true);
-$order_id = isset($data['order_id']) ? intval($data['order_id']) : null;
-$customer_id = isset($data['customer_id']) ? intval($data['customer_id']) : null;
-$reason = isset($data['reason']) ? $data['reason'] : 'Customer requested cancellation';
+$authUser    = requireAuth();
+$customer_id = (int) $authUser['user_id'];
 
-if (!$order_id || !$customer_id) {
-    echo json_encode([
-        'status' => 'error',
-        'message' => 'Order ID and Customer ID are required'
-    ]);
+$data     = json_decode(file_get_contents('php://input'), true) ?: [];
+$order_id = (int) ($data['order_id'] ?? 0);
+$reason   = trim((string) ($data['reason'] ?? ''));
+if ($reason === '') {
+    $reason = 'Customer requested cancellation';
+}
+$reason = mb_substr($reason, 0, 500);
+
+if ($order_id <= 0) {
+    http_response_code(400);
+    echo json_encode(['status' => 'error', 'message' => 'Order ID is required']);
     exit;
 }
 
+$cancellableStatuses = ['pending', 'confirmed', 'processing'];
+
 try {
-    // Verify order belongs to customer and can be cancelled
-    $checkQuery = "
-        SELECT status, payment_status, total 
-        FROM orders 
-        WHERE id = :order_id AND customer_id = :customer_id
-    ";
-    $checkStmt = $conn->prepare($checkQuery);
-    $checkStmt->bindParam(':order_id', $order_id);
-    $checkStmt->bindParam(':customer_id', $customer_id);
-    $checkStmt->execute();
+    $conn->beginTransaction();
+
+    // Lock the row so two cancel taps (or a cancel racing an admin update) can't both run.
+    $checkStmt = $conn->prepare("SELECT status, payment_status FROM orders WHERE id = ? AND customer_id = ? FOR UPDATE");
+    $checkStmt->execute([$order_id, $customer_id]);
     $order = $checkStmt->fetch(PDO::FETCH_ASSOC);
 
     if (!$order) {
-        echo json_encode([
-            'status' => 'error',
-            'message' => 'Order not found or does not belong to you'
-        ]);
+        $conn->rollBack();
+        http_response_code(404);
+        echo json_encode(['status' => 'error', 'message' => 'Order not found or does not belong to you']);
         exit;
     }
 
-    // Check if order can be cancelled (only pending, confirmed, processing)
-    $cancellableStatuses = ['pending', 'confirmed', 'processing'];
-    if (!in_array($order['status'], $cancellableStatuses)) {
-        echo json_encode([
-            'status' => 'error',
-            'message' => 'Order cannot be cancelled at this stage'
-        ]);
+    if (!in_array($order['status'], $cancellableStatuses, true)) {
+        $conn->rollBack();
+        echo json_encode(['status' => 'error', 'message' => 'Order cannot be cancelled at this stage']);
         exit;
     }
-
-    // 🔥 START TRANSACTION HERE - Before any database modifications
-    $conn->beginTransaction();
 
     $old_status = $order['status'];
 
-    // Update order status to cancelled
-    $updateQuery = "
-        UPDATE orders 
+    $conn->prepare("
+        UPDATE orders
         SET status = 'cancelled',
             updated_at = CURRENT_TIMESTAMP,
-            notes = CONCAT(COALESCE(notes, ''), '\nCancellation Reason: ', :reason)
-        WHERE id = :order_id
-    ";
-    $updateStmt = $conn->prepare($updateQuery);
-    $updateStmt->bindParam(':order_id', $order_id);
-    $updateStmt->bindParam(':reason', $reason);
-    $updateStmt->execute();
+            notes = CONCAT(COALESCE(notes, ''), '\nCancellation Reason: ', ?)
+        WHERE id = ?
+    ")->execute([$reason, $order_id]);
 
-    // Add to order status history
-    $historyQuery = "
-        INSERT INTO order_status_history 
-        (order_id, old_status, new_status, changed_by, notes)
-        VALUES 
-        (:order_id, :old_status, 'cancelled', :customer_id, :reason)
-    ";
-    $historyStmt = $conn->prepare($historyQuery);
-    $historyStmt->bindParam(':order_id', $order_id);
-    $historyStmt->bindParam(':old_status', $old_status);
-    $historyStmt->bindParam(':customer_id', $customer_id);
-    $historyStmt->bindParam(':reason', $reason);
-    $historyStmt->execute();
-
-    // If payment was made, initiate refund
-    if ($order['payment_status'] === 'paid') {
-        // Update payment status to refunded
-        $refundQuery = "UPDATE orders SET payment_status = 'refunded' WHERE id = :order_id";
-        $refundStmt = $conn->prepare($refundQuery);
-        $refundStmt->bindParam(':order_id', $order_id);
-        $refundStmt->execute();
-
-        // TODO: Integrate with actual payment gateway for refund
-        // Example: initiateRefund($order_id, $order['total']);
+    try {
+        $conn->prepare("
+            INSERT INTO order_status_history (order_id, old_status, new_status, changed_by, notes)
+            VALUES (?, ?, 'cancelled', ?, ?)
+        ")->execute([$order_id, $old_status, $customer_id, $reason]);
+    } catch (PDOException $e) {
+        error_log('cancel_order.php history skipped: ' . $e->getMessage());
     }
 
-    // Restore product quantities (if you track inventory)
-    // Check if stock column exists first
-    $itemsQuery = "SELECT product_id, quantity FROM order_items WHERE order_id = :order_id";
-    $itemsStmt = $conn->prepare($itemsQuery);
-    $itemsStmt->bindParam(':order_id', $order_id);
-    $itemsStmt->execute();
-    
-    while ($item = $itemsStmt->fetch(PDO::FETCH_ASSOC)) {
-        // Check if stock column exists in products table
-        $checkStockColumn = "SHOW COLUMNS FROM products LIKE 'stock'";
-        $stockCheck = $conn->query($checkStockColumn);
-        
-        if ($stockCheck && $stockCheck->rowCount() > 0) {
-            $restoreQuery = "
-                UPDATE products 
-                SET stock = stock + :quantity 
-                WHERE id = :product_id
-            ";
-            $restoreStmt = $conn->prepare($restoreQuery);
-            $restoreStmt->bindParam(':quantity', $item['quantity']);
-            $restoreStmt->bindParam(':product_id', $item['product_id']);
-            $restoreStmt->execute();
-        }
-    }
+    // Put stock back — only what create_order.php actually took (kg lines).
+    $stockRestored = restoreOrderStock($conn, $order_id);
 
-    // 🔥 COMMIT TRANSACTION - All operations successful
     $conn->commit();
 
     echo json_encode([
-        'status' => 'success',
-        'message' => 'Order cancelled successfully',
-        'refund_initiated' => $order['payment_status'] === 'paid'
+        'status'           => 'success',
+        'message'          => 'Order cancelled successfully',
+        // COD orders are never paid up-front. The payment_status enum has no
+        // 'refunded' value, so paid orders are flagged here for a manual refund.
+        'refund_initiated' => $order['payment_status'] === 'paid',
+        'stock_restored'   => $stockRestored,
     ]);
-
 } catch (PDOException $e) {
     if ($conn->inTransaction()) {
         $conn->rollBack();
     }
     error_log("cancel_order.php DB Error: " . $e->getMessage());
+    http_response_code(500);
     echo json_encode([
         'status'  => 'error',
         'message' => 'An error occurred while cancelling the order. Please try again.'
     ]);
 }
-?>

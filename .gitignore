@@ -14,3 +14,9 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+# Database dumps (contain customer data)
+*.sql
+*.sql.gz
+# ...but schema migrations are code, keep them
+!migrations/*.sql
