@@ -10,7 +10,8 @@
  * Pricing rules (identical to cart.php so the cart and the order agree):
  *   kg line    -> products.price_per_kg  x quantity
  *   piece line -> products.piece_price   x quantity (whole pieces only)
- *   tax 8%, delivery ₹50 unless the subtotal is above ₹500.
+ *   tax = the rate set in Admin → Settings (config/store_settings.php, default 8%),
+ *   delivery ₹50 unless the subtotal is above ₹500.
  *
  * Stock: kg lines are checked and reduced inside the same transaction
  * (rows locked with FOR UPDATE, so two buyers can't take the last kilo).
@@ -29,8 +30,8 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 
 require_once __DIR__ . '/../config/db.php';
 require_once __DIR__ . '/../config/jwt.php';
+require_once __DIR__ . '/../config/store_settings.php';
 
-const TAX_RATE              = 0.08;
 const FREE_SHIPPING_ABOVE   = 500;
 const SHIPPING_FEE          = 50;
 const MAX_LINE_QUANTITY     = 100;
@@ -109,6 +110,7 @@ try {
     $hasItemUnit     = $hasColumn('order_items', 'unit');
     $hasPiecePrice   = $hasColumn('products', 'piece_price');
     $hasStockFlag    = $hasColumn('orders', 'stock_deducted');
+    $hasProductUnit  = $hasColumn('products', 'unit');
 
     // ── Normalise the requested lines (product, unit, quantity) ───────
     // The unit an older client didn't send is read from the buyer's active cart row.
@@ -151,8 +153,9 @@ try {
     $productIds   = array_values(array_unique(array_column($lines, 'product_id')));
     $placeholders = implode(',', array_fill(0, count($productIds), '?'));
     $pieceCol     = $hasPiecePrice ? 'piece_price' : 'NULL AS piece_price';
+    $unitCol      = $hasProductUnit ? 'unit AS product_unit' : "'kg' AS product_unit";
     $pStmt = $conn->prepare("
-        SELECT id, name, price_per_kg, $pieceCol, stock, is_active, max_quantity
+        SELECT id, name, price_per_kg, $pieceCol, $unitCol, stock, is_active, max_quantity
         FROM products
         WHERE id IN ($placeholders)
         FOR UPDATE
@@ -173,10 +176,18 @@ try {
 
         if ($line['unit'] === 'piece') {
             $price = (float) ($p['piece_price'] ?? 0);
-            if ($price <= 0) {
+            $ownUnit = strtolower(trim((string) ($p['product_unit'] ?? '')));
+            if ($price <= 0 && in_array($ownUnit, ['piece', 'pieces', 'dozen', 'bunch', 'pack'], true)) {
+                // The product itself is sold per piece/dozen/bunch/pack and keeps its
+                // price in price_per_kg (no separate piece_price). The website and
+                // cart.php price such a line at price_per_kg, so charge it as a
+                // standard line — the same result as when no unit was sent.
+                $line['unit'] = 'kg';
+            } elseif ($price <= 0) {
                 throw new OrderError("{$p['name']} is not sold by the piece any more. Please review your cart.");
             }
-        } else {
+        }
+        if ($line['unit'] !== 'piece') {
             $price = (float) $p['price_per_kg'];
             $kgByProduct[$line['product_id']] = ($kgByProduct[$line['product_id']] ?? 0) + $line['quantity'];
             $max = (float) ($p['max_quantity'] ?? 0);
@@ -206,8 +217,11 @@ try {
         }
     }
 
+    // Tax rate from Admin → Settings. Same expression as the website/app
+    // (subtotal × percent / 100), so both sides round to the same paise.
+    $taxRatePercent = getTaxRatePercent($conn);
     $subtotal       = round($subtotal, 2);
-    $tax            = round($subtotal * TAX_RATE, 2);
+    $tax            = round($subtotal * ($taxRatePercent / 100), 2);
     $shippingCharge = $subtotal > FREE_SHIPPING_ABOVE ? 0 : SHIPPING_FEE;
     $totalAmount    = round($subtotal + $tax + $shippingCharge, 2);
 
@@ -347,6 +361,7 @@ try {
                     'customer_address' => $customerAddress,
                     'subtotal'         => $subtotal,
                     'tax'              => $tax,
+                    'tax_rate_percent' => $taxRatePercent,
                     'shipping_charge'  => $shippingCharge,
                     'total_amount'     => $totalAmount,
                     'payment_method'   => $paymentMethod,
@@ -381,6 +396,7 @@ try {
             'orderNumber'         => $orderNumber,
             'subtotal'            => $subtotal,
             'tax'                 => $tax,
+            'taxRatePercent'      => $taxRatePercent,
             'shippingCharge'      => $shippingCharge,
             'totalAmount'         => $totalAmount,
             'paymentMethod'       => $paymentMethod,

@@ -246,7 +246,7 @@ function generateInvoiceHTML(array $order, array $items): string {
                         <td class="text-right">₹<?= number_format((float)($order['subtotal'] ?? 0), 2) ?></td>
                     </tr>
                     <tr>
-                        <td>Tax (8%):</td>
+                        <td><?= htmlspecialchars(invoiceTaxLabel($order)) ?>:</td>
                         <td class="text-right">₹<?= number_format((float)($order['tax'] ?? 0), 2) ?></td>
                     </tr>
                     <tr>

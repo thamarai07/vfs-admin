@@ -35,6 +35,28 @@ if (!function_exists('invoiceFormatQty')) {
     }
 }
 
+if (!function_exists('invoiceTaxLabel')) {
+    /**
+     * "Tax (8%)" for an order. Uses the rate the order was placed with when the
+     * caller knows it (create_order passes tax_rate_percent); otherwise works it
+     * out from the order's own saved amounts, so an old order keeps showing the
+     * rate it was charged even after the admin changes the setting.
+     */
+    function invoiceTaxLabel(array $order): string
+    {
+        if (isset($order['tax_rate_percent']) && is_numeric($order['tax_rate_percent'])) {
+            $pct = round((float) $order['tax_rate_percent'], 2);
+        } else {
+            $subtotal = (float) ($order['subtotal'] ?? 0);
+            if ($subtotal <= 0) {
+                return 'Tax';
+            }
+            $pct = round(((float) ($order['tax'] ?? 0)) / $subtotal * 100, 1);
+        }
+        return 'Tax (' . rtrim(rtrim(number_format($pct, 2, '.', ''), '0'), '.') . '%)';
+    }
+}
+
 if (!function_exists('invoiceStoreInfo')) {
     function invoiceStoreInfo(): array
     {
@@ -75,7 +97,7 @@ if (!function_exists('buildOrderInvoiceText')) {
         }
         $l[] = '';
         $l[] = 'Subtotal:  Rs ' . number_format((float) ($order['subtotal'] ?? 0), 2);
-        $l[] = 'Tax (8%):  Rs ' . number_format((float) ($order['tax'] ?? 0), 2);
+        $l[] = invoiceTaxLabel($order) . ':  Rs ' . number_format((float) ($order['tax'] ?? 0), 2);
         $sh = (float) ($order['shipping_charge'] ?? 0);
         $l[] = 'Shipping:  ' . ($sh > 0 ? 'Rs ' . number_format($sh, 2) : 'FREE');
         $l[] = 'TOTAL:     Rs ' . number_format((float) ($order['total_amount'] ?? $order['total'] ?? 0), 2);
@@ -105,6 +127,7 @@ if (!function_exists('buildOrderInvoiceHtml')) {
         $date      = $e(date('d M Y, g:i A', strtotime($order['created_at'] ?? 'now')));
         $subtotalS = $money($order['subtotal'] ?? 0);
         $taxS      = $money($order['tax'] ?? 0);
+        $taxLabel  = $e(invoiceTaxLabel($order));
         $totalS    = $money($order['total_amount'] ?? $order['total'] ?? 0);
         $payMethod = strtoupper($e($order['payment_method'] ?? 'COD'));
         $custName  = $e($order['customer_name'] ?? '');
@@ -195,7 +218,7 @@ if (!function_exists('buildOrderInvoiceHtml')) {
 
       <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:14px;font-size:13px;color:#444;">
         <tr><td style="padding:4px 0;">Subtotal</td><td style="padding:4px 0;text-align:right;">{$subtotalS}</td></tr>
-        <tr><td style="padding:4px 0;">Tax (8%)</td><td style="padding:4px 0;text-align:right;">{$taxS}</td></tr>
+        <tr><td style="padding:4px 0;">{$taxLabel}</td><td style="padding:4px 0;text-align:right;">{$taxS}</td></tr>
         <tr><td style="padding:4px 0;">Shipping</td><td style="padding:4px 0;text-align:right;">{$shipCell}</td></tr>
         <tr><td style="padding:12px 0 0;border-top:2px solid #111;font-weight:800;color:#111;font-size:15px;">Total</td>
             <td style="padding:12px 0 0;border-top:2px solid #111;text-align:right;font-weight:800;color:#16a34a;font-size:17px;">{$totalS}</td></tr>
