@@ -10,7 +10,7 @@
  *  5. FULLTEXT search replaces triple-column LIKE (needs the index below)
  *  6. env() replaced with a safe getenv() wrapper that never fatal-errors
  *  7. Atomic cache writes (tmp → rename) prevent torn reads under concurrency
- *  8. Deterministic fake stats (crc32) instead of rand() — stable across requests
+ *  8. (removed) made-up rating / review_count / view_count fields
  *
  * Required one-time DB setup (run once):
  *   ALTER TABLE products ADD FULLTEXT INDEX ft_search (name, description, category);
@@ -219,12 +219,9 @@ try {
         $p['url']       = "/product/" . urlencode($p['slug']);
         $p['unit']      = $p['unit'] ?? 'kg';
 
-        // Deterministic fake stats — stable across requests, no DB needed yet
-        // Replace with a real reviews/analytics join when that table exists.
-        $h = crc32($p['id'] . 'vfs_salt');
-        $p['view_count']   = 150 + abs($h % 2350);
-        $p['rating']       = round(4.0 + (abs($h % 10) / 10), 1);
-        $p['review_count'] = 25  + abs(($h >> 4) % 425);
+        // No rating / review_count / view_count: these used to be made-up numbers
+        // (a hash of the product id) shown to customers as if they were real.
+        // Add them back only from real data (e.g. the product_reviews table).
 
         // Dates
         $p['created_at'] = date('Y-m-d H:i:s', strtotime($p['created_at']));

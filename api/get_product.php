@@ -140,12 +140,9 @@ try {
         return $p;
     }, $related);
 
-    // ─── Static placeholders (replace with real analytics/reviews table) ──────
-    // Using a deterministic hash so the numbers don't flicker on every refresh
-    $idHash = crc32($row['id'] . 'vfs_salt');
-    $row['view_count']   = 150  + abs($idHash % 2350);
-    $row['rating']       = round(4.0 + (abs($idHash % 10) / 10), 1);
-    $row['review_count'] = 25   + abs(($idHash >> 4) % 425);
+    // No rating / review_count / view_count: these used to be made-up numbers
+    // (a hash of the product id) shown to customers as if they were real.
+    // Add them back only from real data (e.g. the product_reviews table).
 
     // ─── Build response and cache it ──────────────────────────────────────────
     $response = json_encode([
